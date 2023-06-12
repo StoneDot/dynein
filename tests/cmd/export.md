@@ -15,38 +15,42 @@ USAGE:
     dy export [FLAGS] [OPTIONS] --output-file <output-file>
 
 FLAGS:
-    -h, --help         
+    -h, --help
             Prints help information
 
-        --keys-only    
+        --keys-only
             [csv] Export only Primary Key(s). Effective only when --format is 'csv'
 
-    -V, --version      
+    -V, --version
             Prints version information
 
 
 OPTIONS:
-    -a, --attributes <attributes>      
+    -a, --attributes <attributes>
             [csv] Specify attributes to export, separated by commas (e.g. --attributes name,address,age). Effective only
             when --format is 'csv'.
              Note that primary key(s) are always included in results regardless of what you've passed to --attributes
-    -f, --format <format>              
+        --endpoint-url <endpoint-url>
+            Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-2.amazonaws.com/). If you use this
+            option with `--port`, the endpoint is rewritten by the value of`--port`. Stored config of port does not
+            affect the specified endpoint. Please note that the endpoint's URL and the specified region should align
+    -f, --format <format>
             Data format for export items.
              json = JSON format with newline/indent.
              jsonl = JSON Lines (http://jsonlines.org). i.e. one item per line.
              json-compact = JSON format, all items are packed in oneline.
              csv = comma-separated values with header. Use it with --keys-only or --attributes. If neither of them are
             given dynein will ask you target attributes interactively [possible values: csv, json, jsonl, json-compact]
-    -o, --output-file <output-file>    
+    -o, --output-file <output-file>
             Output target filename where dynein exports data into
 
-    -p, --port <port>                  
+    -p, --port <port>
             Specify the port number. This option has an effect only when `--region local` is used
 
-    -r, --region <region>              
+    -r, --region <region>
             The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region local`. You can use
             --region option in both top-level and subcommand-level
-    -t, --table <table>                
+    -t, --table <table>
             Target table of the operation. You can use --table option in both top-level and subcommand-level. You can
             store table schema locally by executing `$ dy use`, after that you need not to specify --table on every
             command
@@ -70,25 +74,30 @@ FLAGS:
     -V, --version      Prints version information
 
 OPTIONS:
-    -a, --attributes <attributes>      [csv] Specify attributes to export, separated by commas (e.g. --attributes
-                                       name,address,age). Effective only when --format is 'csv'.
-                                        Note that primary key(s) are always included in results regardless of what
-                                       you've passed to --attributes
-    -f, --format <format>              Data format for export items.
-                                        json = JSON format with newline/indent.
-                                        jsonl = JSON Lines (http://jsonlines.org). i.e. one item per line.
-                                        json-compact = JSON format, all items are packed in oneline.
-                                        csv = comma-separated values with header. Use it with --keys-only or
-                                       --attributes. If neither of them are given dynein will ask you target attributes
-                                       interactively [possible values: csv, json, jsonl, json-compact]
-    -o, --output-file <output-file>    Output target filename where dynein exports data into
-    -p, --port <port>                  Specify the port number. This option has an effect only when `--region local` is
-                                       used
-    -r, --region <region>              The region to use (e.g. --region us-east-1). When using DynamodB Local, use
-                                       `--region local`. You can use --region option in both top-level and subcommand-
-                                       level
-    -t, --table <table>                Target table of the operation. You can use --table option in both top-level and
-                                       subcommand-level. You can store table schema locally by executing `$ dy use`,
-                                       after that you need not to specify --table on every command
+    -a, --attributes <attributes>        [csv] Specify attributes to export, separated by commas (e.g. --attributes
+                                         name,address,age). Effective only when --format is 'csv'.
+                                          Note that primary key(s) are always included in results regardless of what
+                                         you've passed to --attributes
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -f, --format <format>                Data format for export items.
+                                          json = JSON format with newline/indent.
+                                          jsonl = JSON Lines (http://jsonlines.org). i.e. one item per line.
+                                          json-compact = JSON format, all items are packed in oneline.
+                                          csv = comma-separated values with header. Use it with --keys-only or
+                                         --attributes. If neither of them are given dynein will ask you target
+                                         attributes interactively [possible values: csv, json, jsonl, json-compact]
+    -o, --output-file <output-file>      Output target filename where dynein exports data into
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 ```

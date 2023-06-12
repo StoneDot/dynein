@@ -23,6 +23,11 @@ OPTIONS:
                                             ProjectionExpression (e.g. --attributes name,address,age). Note that primary
                                             key(s) are always included in results regardless of what you've passed to
                                             --attributes
+        --endpoint-url <endpoint-url>       Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                            2.amazonaws.com/). If you use this option with
+                                            `--port`, the endpoint is rewritten by the value of`--port`. Stored config
+                                            of port does not affect the specified endpoint. Please note that the
+                                            endpoint's URL and the specified region should align
     -i, --index <index>                     Read data from index instead of base table
     -l, --limit <limit>                     Limit the number of items to return. By default, the number of items is
                                             determined by DynamoDB
@@ -64,6 +69,11 @@ OPTIONS:
                                             ProjectionExpression (e.g. --attributes name,address,age). Note that primary
                                             key(s) are always included in results regardless of what you've passed to
                                             --attributes
+        --endpoint-url <endpoint-url>       Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                            2.amazonaws.com/). If you use this option with
+                                            `--port`, the endpoint is rewritten by the value of`--port`. Stored config
+                                            of port does not affect the specified endpoint. Please note that the
+                                            endpoint's URL and the specified region should align
     -i, --index <index>                     Read data from index instead of base table
     -l, --limit <limit>                     Limit the number of items to return. By default, the number of items is
                                             determined by DynamoDB

@@ -13,12 +13,19 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 SUBCOMMANDS:
     create    Create new DynamoDB table or GSI. [API: CreateTable, UpdateTable]
@@ -40,12 +47,19 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 SUBCOMMANDS:
     create    Create new DynamoDB table or GSI. [API: CreateTable, UpdateTable]
@@ -67,12 +81,19 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 SUBCOMMANDS:
     create    Create new DynamoDB table or GSI. [API: CreateTable, UpdateTable]
@@ -94,12 +115,19 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 SUBCOMMANDS:
     help     Prints this message or the help of the given subcommand(s)
@@ -118,15 +146,22 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -k, --keys <keys>...     (requried) Primary key(s) of the index. Key name followed by comma and data type (S/N/B).
-                             e.g. for Partition key only table: `--keys myPk,S`, and for Partition and Sort key table
-                             `--keys myPk,S mySk,N`
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -k, --keys <keys>...                 (requried) Primary key(s) of the index. Key name followed by comma and data
+                                         type (S/N/B). e.g. for Partition key only table: `--keys myPk,S`, and for
+                                         Partition and Sort key table `--keys myPk,S mySk,N`
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 ARGS:
     <index-name>    index name to create
@@ -143,15 +178,22 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -k, --keys <keys>...     (requried) Primary key(s) of the table. Key name followed by comma and data type (S/N/B).
-                             e.g. for Partition key only table: `--keys myPk,S`, and for Partition and Sort key table
-                             `--keys myPk,S mySk,N`
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -k, --keys <keys>...                 (requried) Primary key(s) of the table. Key name followed by comma and data
+                                         type (S/N/B). e.g. for Partition key only table: `--keys myPk,S`, and for
+                                         Partition and Sort key table `--keys myPk,S mySk,N`
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 ARGS:
     <new-table-name>    table name to create
@@ -168,12 +210,19 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 SUBCOMMANDS:
     help     Prints this message or the help of the given subcommand(s)
@@ -192,12 +241,19 @@ FLAGS:
         --yes        Skip interactive confirmation before deleting a table
 
 OPTIONS:
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 ARGS:
     <table-name-to-delete>    table name to delete
@@ -215,13 +271,20 @@ FLAGS:
     -V, --version       Prints version information
 
 OPTIONS:
-    -o, --output <output>    Switch output format [possible values: yaml]
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -o, --output <output>                Switch output format [possible values: yaml]
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 ARGS:
     <target-table-to-desc>    Target table name. Optionally you may specify the target table by --table (-t) option
@@ -239,12 +302,19 @@ FLAGS:
     -V, --version        Prints version information
 
 OPTIONS:
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 $ dy admin update --help
 dy-admin-update 0.2.1
@@ -258,12 +328,19 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 SUBCOMMANDS:
     help     Prints this message or the help of the given subcommand(s)
@@ -281,17 +358,25 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -m, --mode <mode>        DynamoDB capacity mode. Availablle values: [provisioned, ondemand]. When you switch from
-                             OnDemand to Provisioned mode, you can pass WCU and RCU as well (NOTE: default capacity unit
-                             for Provisioned mode is 5) [possible values: provisioned, ondemand]
-    -p, --port <port>        Specify the port number. This option has an effect only when `--region local` is used
-        --rcu <rcu>          RCU (read capacity units) for the table. Acceptable only on Provisioned mode
-    -r, --region <region>    The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region
-                             local`. You can use --region option in both top-level and subcommand-level
-    -t, --table <table>      Target table of the operation. You can use --table option in both top-level and subcommand-
-                             level. You can store table schema locally by executing `$ dy use`, after that
-                             you need not to specify --table on every command
-        --wcu <wcu>          WCU (write capacity units) for the table. Acceptable only on Provisioned mode
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -m, --mode <mode>                    DynamoDB capacity mode. Availablle values: [provisioned, ondemand]. When you
+                                         switch from OnDemand to Provisioned mode, you can pass WCU and RCU as well
+                                         (NOTE: default capacity unit for Provisioned mode is 5) [possible values:
+                                         provisioned, ondemand]
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+        --rcu <rcu>                      RCU (read capacity units) for the table. Acceptable only on Provisioned mode
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
+        --wcu <wcu>                      WCU (write capacity units) for the table. Acceptable only on Provisioned mode
 
 ARGS:
     <table-name-to-update>    table name to update

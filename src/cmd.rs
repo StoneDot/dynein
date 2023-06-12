@@ -39,6 +39,13 @@ pub struct Dynein {
     #[structopt(short, long, global = true)]
     pub region: Option<String>,
 
+    /// Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-2.amazonaws.com/).
+    /// If you use this option with `--port`, the endpoint is rewritten by the value of`--port`.
+    /// Stored config of port does not affect the specified endpoint.
+    /// Please note that the endpoint's URL and the specified region should align.
+    #[structopt(long, global = true)]
+    pub endpoint_url: Option<String>,
+
     /// Specify the port number. This option has an effect only when `--region local` is used.
     #[structopt(short, long, global = true)]
     pub port: Option<u32>,

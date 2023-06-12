@@ -14,31 +14,35 @@ USAGE:
     dy import [OPTIONS] --input-file <input-file>
 
 FLAGS:
-    -h, --help       
+    -h, --help
             Prints help information
 
-    -V, --version    
+    -V, --version
             Prints version information
 
 
 OPTIONS:
-    -f, --format <format>            
+        --endpoint-url <endpoint-url>
+            Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-2.amazonaws.com/). If you use this
+            option with `--port`, the endpoint is rewritten by the value of`--port`. Stored config of port does not
+            affect the specified endpoint. Please note that the endpoint's URL and the specified region should align
+    -f, --format <format>
             Data format for import items.
              json = JSON format with newline/indent.
              jsonl = JSON Lines (http://jsonlines.org). i.e. one item per line.
              json-compact = JSON format, all items are packed in oneline.
              csv = comma-separated values with header. Header columns are considered to be DynamoDB attributes [possible
             values: csv, json, jsonl, json-compact]
-    -i, --input-file <input-file>    
+    -i, --input-file <input-file>
             Filename contains DynamoDB items data. Specify appropriate format with --format option
 
-    -p, --port <port>                
+    -p, --port <port>
             Specify the port number. This option has an effect only when `--region local` is used
 
-    -r, --region <region>            
+    -r, --region <region>
             The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region local`. You can use
             --region option in both top-level and subcommand-level
-    -t, --table <table>              
+    -t, --table <table>
             Target table of the operation. You can use --table option in both top-level and subcommand-level. You can
             store table schema locally by executing `$ dy use`, after that you need not to specify --table on every
             command
@@ -60,21 +64,26 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -f, --format <format>            Data format for import items.
-                                      json = JSON format with newline/indent.
-                                      jsonl = JSON Lines (http://jsonlines.org). i.e. one item per line.
-                                      json-compact = JSON format, all items are packed in oneline.
-                                      csv = comma-separated values with header. Header columns are considered to be
-                                     DynamoDB attributes [possible values: csv, json, jsonl, json-compact]
-    -i, --input-file <input-file>    Filename contains DynamoDB items data. Specify appropriate format with --format
-                                     option
-    -p, --port <port>                Specify the port number. This option has an effect only when `--region local` is
-                                     used
-    -r, --region <region>            The region to use (e.g. --region us-east-1). When using DynamodB Local, use
-                                     `--region local`. You can use --region option in both top-level and subcommand-
-                                     level
-    -t, --table <table>              Target table of the operation. You can use --table option in both top-level and
-                                     subcommand-level. You can store table schema locally by executing `$ dy use`, after
-                                     that you need not to specify --table on every command
+        --endpoint-url <endpoint-url>    Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                         2.amazonaws.com/). If you use this option with
+                                         `--port`, the endpoint is rewritten by the value of`--port`. Stored config of
+                                         port does not affect the specified endpoint. Please note that the endpoint's
+                                         URL and the specified region should align
+    -f, --format <format>                Data format for import items.
+                                          json = JSON format with newline/indent.
+                                          jsonl = JSON Lines (http://jsonlines.org). i.e. one item per line.
+                                          json-compact = JSON format, all items are packed in oneline.
+                                          csv = comma-separated values with header. Header columns are considered to be
+                                         DynamoDB attributes [possible values: csv, json, jsonl, json-compact]
+    -i, --input-file <input-file>        Filename contains DynamoDB items data. Specify appropriate format with --format
+                                         option
+    -p, --port <port>                    Specify the port number. This option has an effect only when `--region local`
+                                         is used
+    -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
+                                         `--region local`. You can use --region option in both top-level and subcommand-
+                                         level
+    -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
+                                         subcommand-level. You can store table schema locally by executing `$ dy use`,
+                                         after that you need not to specify --table on every command
 
 ```

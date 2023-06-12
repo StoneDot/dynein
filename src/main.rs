@@ -246,6 +246,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         overwritten_region: app::region_from_str(c.region, c.port),
         overwritten_table_name: c.table,
         overwritten_port: c.port,
+        overwritten_endpoint: None,
         output: None,
     };
     debug!("Initial command context: {:?}", &context);

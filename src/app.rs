@@ -16,6 +16,7 @@
 
 use ::serde::{Deserialize, Serialize};
 use log::{debug, error, info};
+use reqwest::Url;
 use rusoto_dynamodb::*;
 use rusoto_signature::Region;
 use serde_yaml::Error as SerdeYAMLError;
@@ -173,6 +174,7 @@ pub struct Config {
     pub using_region: Option<String>,
     pub using_table: Option<String>,
     pub using_port: Option<u32>,
+    pub using_endpoint: Option<String>,
     // pub cache_expiration_time: Option<i64>, // in second. default 300 (= 5 minutes)
 }
 
@@ -196,6 +198,7 @@ pub struct Context {
     pub overwritten_region: Option<Region>, // --region option
     pub overwritten_table_name: Option<String>, // --table option
     pub overwritten_port: Option<u32>,      // --port option
+    pub overwritten_endpoint: Option<String>, // --endpoint-url option
     pub output: Option<String>,
 }
 
@@ -255,6 +258,52 @@ impl Context {
         };
 
         8000
+    }
+
+    fn retrieve_endpoint_config(&self) -> Option<String> {
+        // if a --endpoint-url option is provided, use it.
+        if self.overwritten_endpoint.is_some() {
+            return self.overwritten_endpoint.to_owned();
+        }
+
+        // `using_endpoint` config is used if region is not changed
+        let using_endpoint_in_config = self
+            .config
+            .as_ref()
+            .and_then(|x| x.using_endpoint.to_owned());
+        if let Some(using_endpoint) = using_endpoint_in_config {
+            if self.overwritten_region.as_ref().map_or_else(
+                || true,
+                |r| {
+                    *r != Region::from_str(&using_endpoint)
+                        .expect("specified region is something wrong")
+                },
+            ) {
+                return Some(using_endpoint);
+            }
+        }
+
+        // otherwise, use default settings of SDK.
+        None
+    }
+
+    pub fn effective_endpoint(&self) -> Option<String> {
+        let endpoint = self.retrieve_endpoint_config();
+
+        if let Some(endpoint) = endpoint {
+            // if --port option is explicitly specified, overwrite endpoint string.
+            if let Some(port) = self.overwritten_port {
+                let mut url = Url::parse(&endpoint).expect("Invalid endpoint is specified");
+                url.set_port(Some(port as u16))
+                    .expect("Invalid port is specified");
+                Some(url.to_string())
+            } else {
+                // the port option in a config is just ignored because the endpoint should contains port information
+                Some(endpoint)
+            }
+        } else {
+            endpoint
+        }
     }
 
     pub fn effective_cache_key(&self) -> String {
@@ -700,13 +749,28 @@ fn save_using_target(cx: &mut Context, desc: TableDescription) -> Result<(), Dyn
         .expect("desc should have table name");
 
     let port: u32 = cx.effective_port();
+    info!("effective port: {:?}", port);
+
+    let endpoint = cx.effective_endpoint();
+    info!("effective endpoint: {:?}", endpoint);
 
     // retrieve current config from Context and update "using target".
-    let region = Some(String::from(cx.effective_region().name()));
+    let region = cx.effective_region();
+    let region_name = region.name();
+    info!("effective region: {:?}", region_name);
+
     let mut config = cx.config.as_mut().expect("cx should have config");
-    config.using_region = region;
+    config.using_region = Some(region_name.to_owned());
     config.using_table = Some(table_name);
-    config.using_port = Some(port);
+    if endpoint.is_some() {
+        // if endpoint is specified, port information is included in endpoint.
+        // thus, we do not need to save using_port
+        config.using_port = None;
+        config.using_endpoint = endpoint;
+    } else {
+        config.using_port = Some(port);
+        config.using_endpoint = endpoint;
+    }
     debug!("config file will be updated with: {:?}", config);
 
     // write to config file
@@ -740,6 +804,7 @@ mod tests {
             overwritten_region: None,
             overwritten_table_name: None,
             overwritten_port: None,
+            overwritten_endpoint: None,
             output: None,
         };
         assert_eq!(cx1.effective_region(), Region::default());
@@ -750,11 +815,13 @@ mod tests {
                 using_region: Some(String::from("ap-northeast-1")),
                 using_table: Some(String::from("cfgtbl")),
                 using_port: Some(8000),
+                using_endpoint: None,
             }),
             cache: None,
             overwritten_region: None,
             overwritten_table_name: None,
             overwritten_port: None,
+            overwritten_endpoint: None,
             output: None,
         };
         assert_eq!(cx2.effective_region(), Region::from_str("ap-northeast-1")?);

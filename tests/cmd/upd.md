@@ -14,40 +14,44 @@ USAGE:
     dy upd [OPTIONS] <pval> [sval]
 
 FLAGS:
-    -h, --help       
+    -h, --help
             Prints help information
 
-    -V, --version    
+    -V, --version
             Prints version information
 
 
 OPTIONS:
-        --atomic-counter <atomic-counter>    
+        --atomic-counter <atomic-counter>
             Increment a Number attribute by 1. e.g. `dy update <keys> --atomic-counter sitePv`
 
-    -p, --port <port>                        
+        --endpoint-url <endpoint-url>
+            Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-2.amazonaws.com/). If you use this
+            option with `--port`, the endpoint is rewritten by the value of`--port`. Stored config of port does not
+            affect the specified endpoint. Please note that the endpoint's URL and the specified region should align
+    -p, --port <port>
             Specify the port number. This option has an effect only when `--region local` is used
 
-    -r, --region <region>                    
+    -r, --region <region>
             The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region local`. You can use
             --region option in both top-level and subcommand-level
-        --remove <remove>                    
+        --remove <remove>
             REMOVE action to remove attribute(s) from an item. --remove cannot be used with --set. e.g. --remove
             'Category, Rank'
-        --set <set>                          
+        --set <set>
             SET action to modify or add attribute(s) of an item. --set cannot be used with --remove. e.g. --set 'name =
             Alice', --set 'Price = Price + 100', or --set 'Replies = 2, Closed = true, LastUpdated = "2020-02-
             22T18:10:57Z"'
-    -t, --table <table>                      
+    -t, --table <table>
             Target table of the operation. You can use --table option in both top-level and subcommand-level. You can
             store table schema locally by executing `$ dy use`, after that you need not to specify --table on every
             command
 
 ARGS:
-    <pval>    
+    <pval>
             Partition Key of the target item
 
-    <sval>    
+    <sval>
             Sort Key of the target item (if any)
 
 
@@ -70,6 +74,11 @@ FLAGS:
 OPTIONS:
         --atomic-counter <atomic-counter>    Increment a Number attribute by 1. e.g. `dy update <keys> --atomic-counter
                                              sitePv`
+        --endpoint-url <endpoint-url>        Specify the endpoint to use (e.g. --endpoint-url http://dynamodb.us-east-
+                                             2.amazonaws.com/). If you use this option with
+                                             `--port`, the endpoint is rewritten by the value of`--port`. Stored config
+                                             of port does not affect the specified endpoint. Please note that the
+                                             endpoint's URL and the specified region should align
     -p, --port <port>                        Specify the port number. This option has an effect only when `--region
                                              local` is used
     -r, --region <region>                    The region to use (e.g. --region us-east-1). When using DynamodB Local, use
