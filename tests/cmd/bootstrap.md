@@ -10,7 +10,7 @@ USAGE:
 
 FLAGS:
     -h, --help       Prints help information
-    -l, --list
+    -l, --list       
     -V, --version    Prints version information
 
 OPTIONS:
@@ -24,7 +24,7 @@ OPTIONS:
     -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
                                          `--region local`. You can use --region option in both top-level and subcommand-
                                          level
-    -s, --sample <sample>
+    -s, --sample <sample>                
     -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
                                          subcommand-level. You can store table schema locally by executing `$ dy use`,
                                          after that you need not to specify --table on every command
@@ -38,7 +38,7 @@ USAGE:
 
 FLAGS:
     -h, --help       Prints help information
-    -l, --list
+    -l, --list       
     -V, --version    Prints version information
 
 OPTIONS:
@@ -52,7 +52,7 @@ OPTIONS:
     -r, --region <region>                The region to use (e.g. --region us-east-1). When using DynamodB Local, use
                                          `--region local`. You can use --region option in both top-level and subcommand-
                                          level
-    -s, --sample <sample>
+    -s, --sample <sample>                
     -t, --table <table>                  Target table of the operation. You can use --table option in both top-level and
                                          subcommand-level. You can store table schema locally by executing `$ dy use`,
                                          after that you need not to specify --table on every command
