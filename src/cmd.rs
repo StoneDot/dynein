@@ -390,6 +390,9 @@ pub enum AdminSub {
         /// List DynamoDB tables in all available regions
         #[structopt(long)]
         all_regions: bool,
+        /// This is test option
+        #[structopt(long)]
+        test_option: bool,
     },
 
     /// Show detailed information of a table. [API: DescribeTable]

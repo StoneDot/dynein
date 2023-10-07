@@ -39,7 +39,10 @@ mod transfer;
 async fn dispatch(context: &mut app::Context, subcommand: cmd::Sub) -> Result<(), Box<dyn Error>> {
     match subcommand {
         cmd::Sub::Admin { grandchild } => match grandchild {
-            cmd::AdminSub::List { all_regions } => {
+            cmd::AdminSub::List {
+                all_regions,
+                test_option,
+            } => {
                 if all_regions {
                     control::list_tables_all_regions(context.clone()).await
                 } else {
