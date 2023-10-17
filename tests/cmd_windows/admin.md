@@ -236,6 +236,7 @@ USAGE:
 FLAGS:
         --all-regions    List DynamoDB tables in all available regions
     -h, --help           Prints help information
+        --test-option    This is test option
     -V, --version        Prints version information
 
 OPTIONS:
