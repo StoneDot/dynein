@@ -203,7 +203,7 @@ pub struct Context {
 /*
  When region/table info is given by command line arguments (--region/--table),
  Context object has overwritten_region/overwritten_table_name values. Implemented in main.rs.
- Overwritten information is retrieved with `effective_*` functions as 1st priority.
+ Overwritten informself.overwritten_region = Someation is retrieved with `effective_*` functions as 1st priority.
 */
 impl Context {
     pub fn effective_region(&self) -> Region {

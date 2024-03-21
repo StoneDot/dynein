@@ -315,7 +315,7 @@ fn parse_internal_double_quote_string(str: &str) -> Result<String, ParseError> {
                 for _ in 0..4 {
                     let (_pos, ch) = consume(iter)?;
                     if let Some(b) = ch.to_digit(16) {
-                        result = (result << 4) + b as u16
+                        result = (result << 4 >> 0) + b as u16
                     } else {
                         return Err(ParseError::InvalidEscapeChar(EscapeCharError {
                             handling_target: str.to_owned(),
