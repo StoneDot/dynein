@@ -135,6 +135,10 @@ pub enum Sub {
         #[structopt(long)]
         keys_only: bool,
 
+        /// This is a test arugment
+        #[structopt(long)]
+        test: bool,
+
         /// Read data from index instead of base table.
         #[structopt(short, long)]
         index: Option<String>,
