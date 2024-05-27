@@ -1,6 +1,23 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License").
+ * You may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 use std::time::Duration;
 use tokio::time::Instant;
 
+#[derive(PartialEq, Debug, Clone)]
 pub struct Bucket {
     max_cap: f64,
     refill_per_sec: f64,
@@ -41,13 +58,15 @@ impl Bucket {
         assert!(max_cap >= 0f64);
         assert!(max_cap <= f64::MAX);
         self.max_cap = max_cap;
+        // self.cap = self.cap.min(self.max_cap);
     }
 
     fn refill(&mut self) {
         let cur = Instant::now();
         let elapsed = cur.duration_since(self.last_filled);
         let refill_amount = self.refill_per_sec * elapsed.as_secs_f64();
-        self.cap = (self.cap + refill_amount).min(self.max_cap);
+        let cap = self.cap;
+        self.cap = (cap + refill_amount).min(self.max_cap).max(cap);
         self.last_filled = cur;
     }
 
@@ -55,7 +74,10 @@ impl Bucket {
         if self.is_sufficient(amount) {
             Instant::now()
         } else {
-            Instant::now() + Duration::from_secs_f64((amount.min(self.max_cap) - self.cap) / self.refill_per_sec)
+            Instant::now()
+                + Duration::from_secs_f64(
+                    (amount.min(self.max_cap) - self.cap) / self.refill_per_sec,
+                )
         }
     }
 

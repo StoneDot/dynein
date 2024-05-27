@@ -1,17 +1,46 @@
-use crate::algo::bucket::Bucket;
-use std::future::Future;
-use tokio::sync::mpsc::Receiver;
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License").
+ * You may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
-enum Signal<T> {
+use crate::algo::bucket::Bucket;
+use crate::algo::monitor::{Monitor, Probe};
+use futures::future::join_all;
+use rand::random;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{channel, Receiver};
+use tokio::task::JoinHandle;
+
+#[derive(PartialEq, Debug, Clone)]
+enum Signal<T>
+where
+    T: Clone,
+{
     Close,
     ChangeRefill(f64),
     ChangeMaxCap(f64),
     Process(T),
 }
 
-struct ThrottledWorker<T> {
+struct ThrottledWorker<T: Clone> {
     recv: Receiver<Signal<T>>,
+    process_notifier: Arc<tokio::sync::Notify>,
     bucket: Bucket,
+    probe: Probe<f64>,
 }
 
 /// Trait representing a process with resource constraints.
@@ -19,9 +48,7 @@ struct ThrottledWorker<T> {
 /// This trait provides methods for estimating the resource required by the process and
 /// processing while consuming the resource.
 trait ResourceConstraintProcess {
-    type ResourceAmountType;
-
-    /// Estimates the amount of resources.
+    /// Estimates the resource based on the given code.
     ///
     /// This method returns an estimation of the amount of resources.
     /// The actual implementation of how the estimation is calculated
@@ -29,28 +56,37 @@ trait ResourceConstraintProcess {
     ///
     /// # Returns
     ///
-    /// Returns an instance of `Self::ResourceAmountType` that represents
+    /// Returns an instance of `f64` that represents
     /// the estimated amount of resources.
-    fn estimate_resource(&self) -> Self::ResourceAmountType;
+    fn estimate_resource(&self) -> f64;
 
-    /// Process and consume a resource.
+    /// Processes and consumes the resource asynchronously.
     ///
     /// This function asynchronously processes and consumes a resource, returning a `Future` that will eventually resolve to the amount of consumed resource.
-    /// The consumed resource type is determined by the associated type `ResourceAmountType` of the struct implementing this method.
+    /// The consumed resource type is determined by the associated type `f64` of the struct implementing this method.
     ///
     /// # Returns
     ///
-    /// An `impl Future` that resolves to the consumed resource amount.
-    fn process_and_consume_resource(&self) -> impl Future<Output = Self::ResourceAmountType>;
+    /// The returned future will resolve to an `f64` value representing the consuming the resource.
+    fn process_and_consume_resource(&self) -> impl Future<Output = f64> + Send;
 }
 
-impl<T: ResourceConstraintProcess<ResourceAmountType = f64> + Send + 'static> ThrottledWorker<T> {
-    fn new(recv: Receiver<Signal<T>>, bucket: Bucket) -> ThrottledWorker<T> {
-        ThrottledWorker { recv, bucket }
+impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledWorker<T> {
+    fn new(
+        recv: Receiver<Signal<T>>,
+        process_notifier: Arc<tokio::sync::Notify>,
+        bucket: Bucket,
+        probe: Probe<f64>,
+    ) -> ThrottledWorker<T> {
+        ThrottledWorker {
+            recv,
+            process_notifier,
+            bucket,
+            probe,
+        }
     }
 
-    // async fn start(&mut self, estimator: fn(&T) -> f64, process: fn(&T) -> Pin<Box<dyn Future<Output=f64> + Send>>) {
-    async fn start(&mut self) {
+    async fn start(mut self) {
         while let Some(v) = self.recv.recv().await {
             match v {
                 Signal::Close => break,
@@ -65,12 +101,172 @@ impl<T: ResourceConstraintProcess<ResourceAmountType = f64> + Send + 'static> Th
                         tokio::time::sleep_until(self.bucket.estimate_available_at(estimate)).await;
                     }
                     let actual = p.process_and_consume_resource().await;
+                    self.probe
+                        .add_observation(actual)
+                        .expect("Failed to insert an observation");
                     self.bucket.feedback(estimate - actual);
+                    self.process_notifier.notify_waiters();
                 }
             }
         }
     }
 }
+
+struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
+    recv: Receiver<T>,
+    workers_tx: Vec<tokio::sync::mpsc::Sender<Signal<T>>>,
+    workers_handle: Vec<JoinHandle<()>>,
+    notifier: Arc<tokio::sync::Notify>,
+    target_limit: f64,
+    monitor: Monitor<f64>,
+    probe: Probe<f64>,
+}
+
+// Even if round trip time is 1s, we can achieve specified WCU with this setting.
+const MINIMUM_WORKER_TARGET_LIMIT: f64 = 1.0;
+
+const NUM_MONITORING_OBSERVATIONS: usize = 32;
+const NUM_STATS_OBSERVATIONS: usize = 32;
+const CHANNEL_BUFFER_SIZE: usize = 16;
+
+const MAX_CLIENT_GENERATION_PER_SECOND: f64 = 10.0;
+
+const SIGMA: f64 = 2.0;
+
+const SCALE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledExecutor<T> {
+    fn new(recv: Receiver<T>, target_limit: f64) -> ThrottledExecutor<T> {
+        let (probe, monitor) = Monitor::new(NUM_MONITORING_OBSERVATIONS, NUM_STATS_OBSERVATIONS);
+        let mut initial = ThrottledExecutor {
+            recv,
+            workers_tx: vec![],
+            workers_handle: vec![],
+            notifier: Arc::new(tokio::sync::Notify::new()),
+            target_limit,
+            monitor,
+            probe,
+        };
+        initial.create_worker(1);
+        initial
+    }
+
+    fn create_worker(&mut self, target_total_worker_num: usize) {
+        let target_limit = self.target_limit / target_total_worker_num as f64;
+        let jitter_sec = random::<f64>()
+            * f64::min(
+                1.0,
+                target_total_worker_num as f64 / MAX_CLIENT_GENERATION_PER_SECOND,
+            );
+        let (tx, rx) = channel::<Signal<T>>(CHANNEL_BUFFER_SIZE);
+        let bucket = Bucket::new(target_limit, target_limit);
+        let worker = ThrottledWorker::new(rx, self.notifier.clone(), bucket, self.probe.clone());
+        self.workers_tx.push(tx);
+        self.workers_handle.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs_f64(jitter_sec)).await;
+            worker.start().await;
+        }));
+    }
+
+    ///
+    async fn start(&mut self) -> Result<(), Vec<tokio::sync::mpsc::error::SendError<Signal<T>>>> {
+        let mut selected_worker = 0;
+
+        while let Some(message) = self.recv.recv().await {
+            let signal = Signal::Process(message);
+            let num_workers = self.workers_handle.len();
+
+            // Distribute messages in round-robin fashion.
+            'delivery_loop: loop {
+                let mut num_closed = 0;
+                for _ in 0..num_workers {
+                    // Try to send a message
+                    match self.workers_tx[selected_worker].try_send(signal.clone()) {
+                        Ok(_) => {
+                            // A message is successfully sent.
+                            break 'delivery_loop;
+                        }
+                        Err(err) => match err {
+                            TrySendError::Full(_) => {}
+                            TrySendError::Closed(_) => num_closed += 1,
+                        },
+                    }
+
+                    // Move to a next worker.
+                    selected_worker = (selected_worker + 1) % num_workers;
+                }
+                // The process should quit when all channels are closed.
+                if num_closed >= num_workers {
+                    return Ok(());
+                }
+
+                // Wait completion of a worker
+                self.notifier.notified().await;
+            }
+
+            // Scale out if the number of workers is insufficient to achieve the target limit.
+            self.scale_out_if_needed().await;
+        }
+
+        // When input channel is closed, all workers should be terminated.
+        let num_workers = self.workers_handle.len();
+        let mut waits = Vec::with_capacity(num_workers);
+        for i in 0..num_workers {
+            waits.push(self.workers_tx[i].send(Signal::Close));
+        }
+        let result = join_all(waits).await;
+
+        // Check whether all workers are terminated successfully.
+        let result: Vec<_> = result.into_iter().filter_map(|item| item.err()).collect();
+        if result.is_empty() {
+            Ok(())
+        } else {
+            Err(result)
+        }
+    }
+
+    fn max_workers(&self) -> usize {
+        f64::floor(self.target_limit / MINIMUM_WORKER_TARGET_LIMIT) as usize
+    }
+
+    async fn scale_out_if_needed(&mut self) {
+        if self
+            .monitor
+            .data_less_than_statistically(self.target_limit, SIGMA)
+            && self.workers_tx.len() < self.max_workers()
+        {
+            self.scale_out(self.workers_tx.len()).await;
+        }
+    }
+
+    /// Scale out workers.
+    async fn scale_out(&mut self, requested_additional_size: usize) {
+        let mut total_size = self.workers_tx.len() + requested_additional_size;
+
+        // Saturate total worker
+        total_size = total_size.min(self.max_workers());
+
+        // Calculate new limit for each worker
+        let target_each_worker = self.target_limit / total_size as f64;
+
+        // Notify the change of the rate to each worker
+        let mut features = Vec::with_capacity(self.workers_tx.len() * 2);
+        for tx in &self.workers_tx {
+            features.push(tx.send(Signal::ChangeMaxCap(target_each_worker)));
+            features.push(tx.send(Signal::ChangeRefill(target_each_worker)));
+        }
+        let _ = join_all(features).await;
+        // TODO: Error handling
+
+        // Create new workers
+        self.workers_tx.reserve(requested_additional_size);
+        self.workers_handle.reserve(requested_additional_size);
+        for _ in 0..requested_additional_size {
+            self.create_worker(total_size);
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -136,17 +332,15 @@ mod test {
     }
 
     impl ResourceConstraintProcess for TestProcess {
-        type ResourceAmountType = f64;
-
-        fn estimate_resource(&self) -> Self::ResourceAmountType {
+        fn estimate_resource(&self) -> f64 {
             self.tx.send(Message::Estimated).unwrap();
-            return self.estimate;
+            self.estimate
         }
 
-        fn process_and_consume_resource(&self) -> impl Future<Output = Self::ResourceAmountType> {
+        fn process_and_consume_resource(&self) -> impl Future<Output = f64> {
             self.tx.send(Message::Consumed).unwrap();
             let v = self.actual;
-            return async move { v };
+            async move { v }
         }
     }
 
@@ -166,7 +360,8 @@ mod test {
         let mut bucket = Bucket::new(1f64, 1f64);
         bucket.fill();
         // cap = 1
-        let mut worker = ThrottledWorker::new(rx, bucket);
+        let (probe, _monitor) = Monitor::new(3, 3);
+        let worker = ThrottledWorker::new(rx, Arc::new(tokio::sync::Notify::new()), bucket, probe);
         let handle = tokio::spawn(async move { worker.start().await });
 
         // Consume all capacity immediately
@@ -201,10 +396,31 @@ mod test {
 
         // Change refill rate back and change max capacity
         tx.send(Signal::ChangeRefill(1f64)).await.unwrap();
+        // Check overestimate
+        let (process, rx) = TestProcess::new(1f64, 0.5);
+        tx.send(Signal::Process(process)).await.unwrap();
+        assert_timing!(0.9, 1.1, rx.wait_consumed().await);
+        // cap = 0.5
+        let (process, rx) = TestProcess::new(0.5, 0.5);
+        tx.send(Signal::Process(process)).await.unwrap();
+        assert_timing!(0.0, 0.1, rx.wait_consumed().await);
+        // cap = 0
+
+        // Change max capacity
         tx.send(Signal::ChangeMaxCap(3f64)).await.unwrap();
         let (process, rx) = TestProcess::new(2f64, 2f64);
         tx.send(Signal::Process(process)).await.unwrap();
         assert_timing!(1.9, 2.1, rx.wait_consumed().await);
+        // cap = 0
+        // Check severe overestimate
+        let (process, rx) = TestProcess::new(3.0, 1.0);
+        tx.send(Signal::Process(process)).await.unwrap();
+        assert_timing!(2.9, 3.1, rx.wait_consumed().await);
+        // cap = 2
+        let (process, rx) = TestProcess::new(2.0, 2.0);
+        tx.send(Signal::Process(process)).await.unwrap();
+        assert_timing!(0.0, 0.1, rx.wait_consumed().await);
+        // cap = 0
 
         // Exit worker
         tx.send(Signal::Close).await.unwrap();
