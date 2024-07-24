@@ -135,6 +135,10 @@ pub enum Sub {
         #[clap(long, verbatim_doc_comment)]
         keys_only: bool,
 
+        /// This is a test arugment
+        #[structopt(long)]
+        test: bool,
+
         /// Read data from index instead of base table.
         #[clap(short, long, verbatim_doc_comment)]
         index: Option<String>,
