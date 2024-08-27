@@ -15,6 +15,9 @@
  */
 
 use console::Term;
+use dialoguer::Confirm;
+use log::{debug, error, warn};
+use serde_json::{de::StrRead, Deserializer, StreamDeserializer, Value as JsonValue};
 use std::collections::VecDeque;
 use std::time::Instant;
 use std::{
@@ -23,21 +26,21 @@ use std::{
     io::{Error as IOError, Write},
     path::Path,
 };
-
-use dialoguer::Confirm;
-use log::{debug, error};
-use serde_json::{de::StrRead, Deserializer, StreamDeserializer, Value as JsonValue};
-
-use aws_sdk_dynamodb::{
-    operation::scan::ScanOutput,
-    types::{AttributeValue, WriteRequest},
-};
-use thiserror::Error;
-
-use super::app;
+use std::fmt::Debug;
 use super::batch;
 use super::data;
 use super::ddb::table;
+use super::{algo, app};
+use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemError;
+use aws_sdk_dynamodb::operation::RequestId;
+use aws_sdk_dynamodb::types::ReturnConsumedCapacity;
+use aws_sdk_dynamodb::{
+    operation::scan::ScanOutput,
+    types::{AttributeValue, WriteRequest},
+    Client as DynamoDbSdkClient,
+};
+use aws_smithy_runtime_api::client::result::SdkError;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum DyneinExportError {
@@ -317,7 +320,8 @@ pub async fn import(
     match format_str {
         None | Some("json") | Some("json-compact") => {
             let array_of_json_obj: Vec<JsonValue> = serde_json::from_str(&input_string)?;
-            write_array_of_jsons_with_chunked_25(cx, array_of_json_obj, enable_set_inference)
+            // TODO: to change configurable
+            stream_write_of_jsons_with_chucked(cx, array_of_json_obj.into_iter(), enable_set_inference, 100.0)
                 .await?;
         }
         Some("jsonl") => {
@@ -550,11 +554,179 @@ async fn write_array_of_jsons_with_chunked_25(
     for chunk /* Vec<JsonValue> */ in array_of_json_obj.chunks(25) { // As BatchWriteItem request can have up to 25 items.
         let items = chunk.to_vec();
         let count = items.len();
-        let request_items: HashMap<String, Vec<WriteRequest>> = batch::convert_jsonvals_to_request_items(cx, items, enable_set_inference).await?;
+        let request_items: HashMap<String, Vec<WriteRequest>> = batch::convert_jsonvals_to_request_items(cx, &items, enable_set_inference).await?;
         batch::batch_write_until_processed(cx, request_items).await?;
         progress_status.add_observation(count);
         progress_status.show();
     }
+    Ok(())
+}
+
+async fn stream_write_of_jsons_with_chucked(
+    cx: &app::Context,
+    iter: impl Iterator<Item = JsonValue>,
+    enable_set_inference: bool,
+    max_wcu: f64,
+) -> Result<(), batch::DyneinBatchError> {
+    let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
+
+    // This channel is used to queue each write request to a table.
+    // Retryable individual items are queued into this queue.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteRequest>(500);
+
+    let retry_config = cx
+        .retry
+        .as_ref()
+        .map(|v| v.batch_write_item.as_ref().unwrap_or(&v.default));
+    let config = cx
+        .effective_sdk_config_with_retry(retry_config.cloned())
+        .await;
+    let ddb = DynamoDbSdkClient::new(&config);
+
+    #[derive(Clone)]
+    struct BatchWriteProcess {
+        write_items: HashMap<String, Vec<WriteRequest>>,
+        ddb: DynamoDbSdkClient,
+        tx_retry: tokio::sync::mpsc::Sender<WriteRequest>,
+    }
+
+    impl algo::worker::ResourceConstraintProcess for BatchWriteProcess {
+        fn estimate_resource(&self) -> f64 {
+            let mut total_estimate = 0.0;
+            for (_tbl, reqs) in &self.write_items {
+                for req in reqs {
+                    if let Some(ref put_req) = req.put_request {
+                        let bytes = crate::ddb::item::calculate_estimated_item_size(&put_req.item)
+                            .expect("An invalid attribute is detected");
+                        total_estimate += f64::ceil(bytes as f64 / 1024.0);
+                    }
+                    if req.delete_request.is_some() {
+                        // We cannot estimate exact consumed WCU because consumed WCU is based on the size of an item.
+                        // See: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/read-write-operations.html#write-operation-consumption
+                        // Therefore, we always estimate it as 1 WCR/WRU.
+                        // We will revisit based on customer feedbacks.
+                        // Please note that this behavior is acceptable because we have feedback mechanism.
+                        // A duration to the next request will be adjusted based on the actual consumption.
+                        total_estimate += 1.0;
+                    }
+                }
+            }
+            total_estimate
+        }
+
+        async fn process_and_consume_resource(&self) -> f64 {
+            let mut total_consumed = 0.0;
+            let result = self
+                .ddb
+                .batch_write_item()
+                .set_request_items(Some(self.write_items.clone()))
+                .set_return_consumed_capacity(Some(ReturnConsumedCapacity::Total))
+                .send()
+                .await;
+            match result {
+                Ok(output) => {
+                    // Handle unprocessed_items. They are queued for later retry.
+                    if let Some(unprocessed_items) = output.unprocessed_items {
+                        for (_, write_requests) in unprocessed_items {
+                            for write_request in write_requests {
+                                self.tx_retry
+                                    .send(write_request)
+                                    .await
+                                    .expect("Failed to send retry item.");
+                            }
+                        }
+                    }
+
+                    // Calculate total consumed WCU/WRU
+                    total_consumed = output
+                        .consumed_capacity
+                        .unwrap_or(vec![])
+                        .iter()
+                        .map(|x| x.capacity_units.unwrap_or(0.0))
+                        .sum()
+                }
+                Err(err) => {
+                    // Check whether retryable error.
+                    // https://docs.rs/aws-sdk-dynamodb/latest/aws_sdk_dynamodb/enum.Error.html
+                    // https://docs.rs/aws-sdk-dynamodb/latest/aws_sdk_dynamodb/operation/batch_write_item/enum.BatchWriteItemError.html
+                    //
+                    // If it is retryable, insert all items into a queue and log warning.
+                    // If it is not retryable, log errors.
+                    // Following the action, whether it continues or exits, is determined based on settings.
+                    match err {
+                        SdkError::ServiceError(err) => {
+                            match err.err() {
+                                BatchWriteItemError::InternalServerError(_)
+                                | BatchWriteItemError::ProvisionedThroughputExceededException(_)
+                                | BatchWriteItemError::RequestLimitExceeded(_) => {
+                                    warn!("BatchWriteItem got retryable error (queued to retry): {}\n{:?}", err.err(), err);
+                                }
+                                _ => {
+                                    // Non-retryable errors
+                                    error!(
+                                        "BatchWriteItem got fatal error: {}\n{:?}",
+                                        err.err(),
+                                        err
+                                    );
+                                    error!("Request ID: {:?}", err.raw().request_id());
+                                }
+                            }
+                        }
+                        _ => {
+                            // Non-retryable errors.
+                            // We ignore TimeoutError and ResponseError because it may happen due to configuration problem.
+                            error!("BatchWriteItem got fatal error: {:?}", err);
+                        }
+                    }
+                    // Depending on the settings, decide whether to continue or exit
+                    // Here, let's assume we log and continue.
+                    // TODO: Write logic
+                }
+            }
+            total_consumed
+        }
+    }
+
+    // This channel is used to queue each a BatchWriteItem request.
+    let (tx2, rx2) = tokio::sync::mpsc::channel::<BatchWriteProcess>(16);
+    // TODO: tx2 should be closed after all item are processed.
+    let mut executor = algo::worker::ThrottledExecutor::new(rx2, max_wcu);
+
+    let cx = cx.clone();
+    let tx3 = tx.clone();
+    let handle = tokio::spawn(async move {
+        let mut items = Vec::with_capacity(25);
+        while let Some(item) = rx.recv().await {
+            items.push(item);
+            if items.len() == 25 {
+                let count = items.len();
+
+                // Send batch execution
+                let request_items = HashMap::from([(cx.effective_table_name(), items)]);
+                tx2.send(BatchWriteProcess {
+                    write_items: request_items,
+                    ddb: ddb.clone(),
+                    tx_retry: tx3.clone(),
+                })
+                .await
+                .expect("Failed to pass items to write");
+
+                items = Vec::with_capacity(25);
+                progress_status.add_observation(count);
+                progress_status.show();
+            }
+        }
+    });
+
+    for item in iter {
+        let item = batch::convert_jsonval_to_hashmap(&item, enable_set_inference);
+        let write_request = batch::construct_put_write_request(item);
+        tx.send(write_request)
+            .await
+            .expect("Unexpected channel close.")
+    }
+    handle.await.expect("Failed to queue all items.");
+    executor.start().await.expect("Failed to handle all writes");
     Ok(())
 }
 
