@@ -21,7 +21,7 @@ use rand::random;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio::task::JoinHandle;
@@ -73,7 +73,7 @@ pub trait ResourceConstraintProcess {
     fn process_and_consume_resource(&self) -> impl Future<Output = f64> + Send;
 }
 
-impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledWorker<T> {
+impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledWorker<T> {
     fn new(
         recv: Receiver<Signal<T>>,
         process_notifier: Arc<tokio::sync::Notify>,
@@ -93,9 +93,16 @@ impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledWorker<T> {
         while let Some(v) = self.recv.recv().await {
             match v {
                 Signal::Close => break,
-                Signal::ChangeRefill(refill) => self.bucket.update_refill_rate(refill),
-                Signal::ChangeMaxCap(max_cap) => self.bucket.update_max_cap(max_cap),
+                Signal::ChangeRefill(refill) => {
+                    debug!("Changed refill rate: {}", refill);
+                    self.bucket.update_refill_rate(refill)
+                }
+                Signal::ChangeMaxCap(max_cap) => {
+                    debug!("Changed max cap: {}", max_cap);
+                    self.bucket.update_max_cap(max_cap)
+                }
                 Signal::Process(p) => {
+                    trace!("Got process request {:?}", p);
                     let estimate = p.estimate_resource();
                     loop {
                         if self.bucket.try_consume(estimate) {
@@ -124,18 +131,22 @@ pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
     target_limit: f64,
     monitor: Monitor<f64>,
     probe: Probe<f64>,
+    latest_scale_out: Instant,
 }
 
 // Even if round trip time is 1s, we can achieve specified WCU with this setting.
 const MINIMUM_WORKER_TARGET_LIMIT: f64 = 1.0;
 
-const NUM_MONITORING_OBSERVATIONS: usize = 32;
-const NUM_STATS_OBSERVATIONS: usize = 32;
+const NUM_MONITORING_OBSERVATIONS: usize = 64;
+const NUM_STATS_OBSERVATIONS: usize = 64;
 const CHANNEL_BUFFER_SIZE: usize = 16;
 
 const MAX_CLIENT_GENERATION_PER_SECOND: f64 = 10.0;
 
-const SIGMA: f64 = 2.0;
+const DEFAULT_MAX_CONCURRENT_CONNECTION: usize = 1000;
+
+const SIGMA: f64 = 3.0;
+const SCALE_WAIT_FACTOR: f64 = 3.0;
 
 impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExecutor<T> {
     pub fn new(recv: Receiver<T>, target_limit: f64) -> ThrottledExecutor<T> {
@@ -148,18 +159,19 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             target_limit,
             monitor,
             probe,
+            latest_scale_out: Instant::now(),
         };
         initial.create_worker(1);
         initial
     }
 
+    fn num_workers(&self) -> usize {
+        self.workers_handle.len()
+    }
+
     fn create_worker(&mut self, target_total_worker_num: usize) {
         let target_limit = self.target_limit / target_total_worker_num as f64;
-        let jitter_sec = random::<f64>()
-            * f64::min(
-                1.0,
-                target_total_worker_num as f64 / MAX_CLIENT_GENERATION_PER_SECOND,
-            );
+        let jitter_sec = random::<f64>() * self.jitter_max_secs(target_total_worker_num);
         let (tx, rx) = channel::<Signal<T>>(CHANNEL_BUFFER_SIZE);
         let bucket = Bucket::new(target_limit, target_limit);
         let worker = ThrottledWorker::new(rx, self.notifier.clone(), bucket, self.probe.clone());
@@ -170,17 +182,28 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         }));
     }
 
+    /// Runs the throttled executor, distributing incoming messages to workers in a round-robin
+    /// fashion. The function also handles scaling out workers if the load exceeds target limits.
     ///
-    pub async fn start(
-        &mut self,
-    ) -> Result<(), Vec<tokio::sync::mpsc::error::SendError<Signal<T>>>> {
+    /// # Errors
+    /// Returns a `Vec` of `tokio::sync::mpsc::error::SendError<Signal<T>>` if any workers fail to
+    /// terminate gracefully when the input channel is closed.
+    ///
+    /// # Details
+    /// - The function receives messages from the input channel and sends them to the workers.
+    /// - Messages are distributed using a round-robin approach.
+    /// - If a worker's channel is closed, it tries to deliver the message to another worker.
+    /// - If all worker channels are closed, the function terminates.
+    /// - The function monitors workers' performance, scaling out if necessary to meet the target limit.
+    /// - When the input channel closes, the function ensures all workers receive a `Close` signal and checks that they terminate successfully.
+    pub async fn run(&mut self) -> Result<(), Vec<tokio::sync::mpsc::error::SendError<Signal<T>>>> {
         let mut selected_worker = 0;
 
         while let Some(message) = self.recv.recv().await {
             trace!("Received new message in a worker: {:?}", message);
 
             let signal = Signal::Process(message);
-            let num_workers = self.workers_handle.len();
+            let num_workers = self.num_workers();
 
             // Distribute messages in round-robin fashion.
             'delivery_loop: loop {
@@ -215,7 +238,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         }
 
         // When input channel is closed, all workers should be terminated.
-        let num_workers = self.workers_handle.len();
+        let num_workers = self.num_workers();
         let mut waits = Vec::with_capacity(num_workers);
         for i in 0..num_workers {
             waits.push(self.workers_tx[i].send(Signal::Close));
@@ -232,10 +255,31 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
     }
 
     fn max_workers(&self) -> usize {
-        f64::floor(self.target_limit / MINIMUM_WORKER_TARGET_LIMIT) as usize
+        DEFAULT_MAX_CONCURRENT_CONNECTION
+            .min(f64::floor(self.target_limit / MINIMUM_WORKER_TARGET_LIMIT) as usize)
+    }
+
+    fn jitter_max_secs(&self, target_total_worker_num: usize) -> f64 {
+        f64::min(
+            1.0,
+            target_total_worker_num as f64 / MAX_CLIENT_GENERATION_PER_SECOND,
+        )
+    }
+
+    fn elapsed_enough_time_to_scale(&self) -> bool {
+        self.latest_scale_out.elapsed()
+            >= Duration::from_secs_f64(SCALE_WAIT_FACTOR * self.jitter_max_secs(self.num_workers()))
     }
 
     async fn scale_out_if_needed(&mut self) {
+        // Wait ramp up time to scale resource consumption
+        if !self.elapsed_enough_time_to_scale() {
+            return;
+        }
+
+        // Evaluate whether scale out is effective to increase resource consumption
+
+        // Scale out if resource consumption is not enough
         if self
             .monitor
             .data_less_than_statistically(self.target_limit, SIGMA)
@@ -257,7 +301,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
 
         // Calculate new limit for each worker
         let target_each_worker = self.target_limit / total_size as f64;
-        info!("New target limit each worker: {}", self.target_limit);
+        info!("New target limit each worker: {}", target_each_worker);
 
         // Notify the change of the rate to each worker
         let mut features = Vec::with_capacity(original_size * 2);
@@ -274,6 +318,9 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         for _ in 0..requested_additional_size {
             self.create_worker(total_size);
         }
+
+        // Update scale out time
+        self.latest_scale_out = Instant::now();
 
         info!("Scaled out from {} to {}", original_size, total_size)
     }
