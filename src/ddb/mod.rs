@@ -14,6 +14,6 @@
  * limitations under the License.
  */
 
-mod item;
+pub(crate) mod item;
 pub mod key;
 pub mod table;

@@ -356,7 +356,7 @@ pub async fn batch_write_item(
 /// Note that this function assumes that target table is only one table.
 pub async fn convert_jsonvals_to_request_items(
     cx: &app::Context,
-    items_jsonval: Vec<JsonValue>,
+    items_jsonval: &Vec<JsonValue>,
     enable_set_inference: bool,
 ) -> Result<HashMap<String, Vec<WriteRequest>>, DyneinBatchError> {
     let mut results = HashMap::<String, Vec<WriteRequest>>::new();
@@ -364,30 +364,41 @@ pub async fn convert_jsonvals_to_request_items(
 
     for item_jsonval in items_jsonval {
         // Focusing on an item - iterate over attributes in an item.
-        let mut item = HashMap::<String, AttributeValue>::new();
-        for (attr_name, body) in item_jsonval
-            .as_object()
-            .expect("should be valid JSON object")
-            .iter()
-        {
-            item.insert(
-                attr_name.to_string(),
-                data::dispatch_jsonvalue_to_attrval(body, enable_set_inference),
-            );
-        }
+        let item = convert_jsonval_to_hashmap(&item_jsonval, enable_set_inference);
 
         // Fill meaningful put_request here, then push it to the write_requests. Then go to the next item.
-        write_requests.push(
-            WriteRequest::builder()
-                .put_request(PutRequest::builder().set_item(Some(item)).build().unwrap())
-                .build(),
-        );
+        write_requests.push(construct_put_write_request(item));
     }
 
     // A single table name as a key, and insert all (up to 25) write_requests under the single table.
     results.insert(cx.effective_table_name(), write_requests);
 
     Ok(results)
+}
+
+pub fn convert_jsonval_to_hashmap(
+    json_value: &JsonValue,
+    enable_set_inference: bool,
+) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::<String, AttributeValue>::new();
+    error!("{:?}", json_value);
+    for (attr_name, body) in json_value
+        .as_object()
+        .expect("should be valid JSON object")
+        .iter()
+    {
+        item.insert(
+            attr_name.to_string(),
+            data::dispatch_jsonvalue_to_attrval(body, enable_set_inference),
+        );
+    }
+    item
+}
+
+pub fn construct_put_write_request(item: HashMap<String, AttributeValue>) -> WriteRequest {
+    WriteRequest::builder()
+        .put_request(PutRequest::builder().set_item(Some(item)).build().unwrap())
+        .build()
 }
 
 /// "matrix" is a vector of vectors. These internal vectors has strs, each of them is an attribute for an item.

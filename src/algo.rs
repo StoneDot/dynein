@@ -1,3 +1,3 @@
 mod bucket;
 mod monitor;
-mod worker;
+pub mod worker;

@@ -114,7 +114,7 @@ where
 
     fn avg(&self) -> Option<f64> {
         // Skip calculation if there is no enough data to calculate average
-        if self.stat_points.len() <= 0 {
+        if self.stat_points.len() == 0 {
             return None;
         }
 

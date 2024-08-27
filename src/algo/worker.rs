@@ -26,7 +26,7 @@ use tokio::sync::mpsc::{channel, Receiver};
 use tokio::task::JoinHandle;
 
 #[derive(PartialEq, Debug, Clone)]
-enum Signal<T>
+pub enum Signal<T>
 where
     T: Clone,
 {
@@ -47,7 +47,8 @@ struct ThrottledWorker<T: Clone> {
 ///
 /// This trait provides methods for estimating the resource required by the process and
 /// processing while consuming the resource.
-trait ResourceConstraintProcess {
+/// TODO: extend the implementation to support GSIs and tables
+pub trait ResourceConstraintProcess {
     /// Estimates the resource based on the given code.
     ///
     /// This method returns an estimation of the amount of resources.
@@ -105,14 +106,14 @@ impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledWorker<T> {
                         .add_observation(actual)
                         .expect("Failed to insert an observation");
                     self.bucket.feedback(estimate - actual);
-                    self.process_notifier.notify_waiters();
+                    self.process_notifier.notify_one();
                 }
             }
         }
     }
 }
 
-struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
+pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
     recv: Receiver<T>,
     workers_tx: Vec<tokio::sync::mpsc::Sender<Signal<T>>>,
     workers_handle: Vec<JoinHandle<()>>,
@@ -133,10 +134,8 @@ const MAX_CLIENT_GENERATION_PER_SECOND: f64 = 10.0;
 
 const SIGMA: f64 = 2.0;
 
-const SCALE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-
 impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledExecutor<T> {
-    fn new(recv: Receiver<T>, target_limit: f64) -> ThrottledExecutor<T> {
+    pub fn new(recv: Receiver<T>, target_limit: f64) -> ThrottledExecutor<T> {
         let (probe, monitor) = Monitor::new(NUM_MONITORING_OBSERVATIONS, NUM_STATS_OBSERVATIONS);
         let mut initial = ThrottledExecutor {
             recv,
@@ -169,7 +168,9 @@ impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledExecutor<T>
     }
 
     ///
-    async fn start(&mut self) -> Result<(), Vec<tokio::sync::mpsc::error::SendError<Signal<T>>>> {
+    pub async fn start(
+        &mut self,
+    ) -> Result<(), Vec<tokio::sync::mpsc::error::SendError<Signal<T>>>> {
         let mut selected_worker = 0;
 
         while let Some(message) = self.recv.recv().await {
