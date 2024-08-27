@@ -50,7 +50,6 @@ impl Bucket {
         }
     }
 
-    #[cfg(debug_assertions)]
     fn inspect_internal_state(&self) {
         assert!(self.max_cap >= 0f64);
         assert!(self.max_cap <= f64::MAX);

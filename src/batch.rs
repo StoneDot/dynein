@@ -22,7 +22,7 @@ use aws_sdk_dynamodb::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
-use log::{debug, error};
+use log::{debug, error, trace};
 use serde_json::Value as JsonValue;
 use std::{collections::HashMap, error, fmt, fs, io::Error as IOError};
 
@@ -381,7 +381,7 @@ pub fn convert_jsonval_to_hashmap(
     enable_set_inference: bool,
 ) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::<String, AttributeValue>::new();
-    error!("{:?}", json_value);
+    trace!("Input JsonValue: {:?}", json_value);
     for (attr_name, body) in json_value
         .as_object()
         .expect("should be valid JSON object")
@@ -392,6 +392,7 @@ pub fn convert_jsonval_to_hashmap(
             data::dispatch_jsonvalue_to_attrval(body, enable_set_inference),
         );
     }
+    trace!("Converted to HashMap: {:?}", item);
     item
 }
 

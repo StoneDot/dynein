@@ -18,6 +18,25 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::HashMap;
 use thiserror::Error;
 
+///
+/// Calculates the estimated size of a DynamoDB item.
+///
+/// This function estimates the size of a DynamoDB item by summing up the size of its keys and the
+/// size of their corresponding attribute values. The size of each attribute value is determined
+/// using the `calculate_estimated_attr_size` function.
+///
+/// # Arguments
+///
+/// * `item` - A reference to a `HashMap` where the keys are `String` and the values are `AttributeValue`.
+///
+/// # Returns
+///
+/// This function returns a `Result` containing the total estimated size of the item in bytes. If
+/// the item contains an invalid attribute, an `ItemSizeCalculationError` is returned.
+///
+/// # Errors
+///
+/// Returns an `ItemSizeCalculationError` if any attribute value in the item is invalid.
 pub fn calculate_estimated_item_size(
     item: &HashMap<String, AttributeValue>,
 ) -> Result<usize, ItemSizeCalculationError> {
@@ -28,6 +47,15 @@ pub fn calculate_estimated_item_size(
     Ok(total)
 }
 
+///
+/// Enum representing possible errors during item size calculation.
+/// This enum derives the `Error`, `PartialEq`, `Debug`, `Clone`, and `Hash` traits.
+///
+/// # Variants
+///
+/// * `InvalidAttribute` - Represents an error when an invalid attribute is encountered.
+/// * `InvalidNumberFormat` - Represents an error when a number attribute has an invalid format.
+///
 #[derive(Error, PartialEq, Debug, Clone, Hash)]
 pub enum ItemSizeCalculationError {
     #[error("contain an invalid attribute")]
@@ -37,6 +65,9 @@ pub enum ItemSizeCalculationError {
 }
 
 /// Calculate the estimated size of an `AttributeValue`.
+///
+/// A size of attribute value is determined by heuristic described in the
+/// [official document](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/CapacityUnitCalculations.html).
 ///
 /// # Arguments
 ///
@@ -83,6 +114,16 @@ fn calc_num_size(num: &str) -> Result<usize, NumberParseError> {
     Ok((frac as usize + 1) / 2 + 1)
 }
 
+///
+/// Enum to represent possible errors that can occur when parsing a string into a number.
+///
+/// Variants:
+///
+/// * `UnexpectedChar { unexpected_byte, pos }` - Occurs when an unexpected byte is encountered at a specific position.
+/// * `IncompleteInput` - Occurs when the provided string is incomplete for parsing a valid number.
+/// * `EmptyString` - Occurs when an empty string is provided.
+///
+/// This enum derives the `Error`, `PartialEq`, `Debug`, and `Clone` traits for better error handling and debugging.
 #[derive(Error, PartialEq, Debug, Clone, Hash)]
 pub enum NumberParseError {
     #[error("unexpected byte '{unexpected_byte:?}' at {pos:?}")]

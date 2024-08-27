@@ -29,7 +29,7 @@ use aws_sdk_dynamodb::{
 use aws_smithy_runtime_api::client::result::SdkError;
 use console::Term;
 use dialoguer::Confirm;
-use log::{debug, error, warn};
+use log::{debug, error, info, trace, warn};
 use serde_json::{de::StrRead, Deserializer, StreamDeserializer, Value as JsonValue};
 use std::collections::VecDeque;
 use std::fmt::Debug;
@@ -136,7 +136,7 @@ impl ProgressState {
     }
 }
 
-const MAX_NUMBER_OF_OBSERVES: usize = 10;
+const MAX_NUMBER_OF_OBSERVES: usize = 64;
 
 const VISUALIZE_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -315,22 +315,26 @@ pub async fn import(
         }
     }
 
+    info!("Start loading a file");
     let input_string: String = if Path::new(&input_file).exists() {
         fs::read_to_string(&input_file)?
     } else {
         error!("Couldn't find the input file '{}'.", &input_file);
         std::process::exit(1);
     };
+    info!("Loaded a file");
 
     match format_str {
         None | Some("json") | Some("json-compact") => {
+            info!("Start JSON conversion");
             let array_of_json_obj: Vec<JsonValue> = serde_json::from_str(&input_string)?;
+            info!("End JSON conversion");
             // TODO: to change configurable
             stream_write_of_jsons_with_chucked(
                 cx,
                 array_of_json_obj.into_iter(),
                 enable_set_inference,
-                100.0,
+                100_000.0,
             )
             .await?;
         }
@@ -572,6 +576,8 @@ async fn write_array_of_jsons_with_chunked_25(
     Ok(())
 }
 
+const BATCH_WRITE_BUFFER_SIZE: usize = 500;
+
 async fn stream_write_of_jsons_with_chucked(
     cx: &app::Context,
     iter: impl Iterator<Item = JsonValue>,
@@ -589,8 +595,9 @@ async fn stream_write_of_jsons_with_chucked(
 
     // This channel is used to queue each write request to a table.
     // Retryable individual items are queued into this queue.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteRequest>(500);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteRequest>(BATCH_WRITE_BUFFER_SIZE);
 
+    // Setup DynamoDB Client for BatchWriteItem
     let retry_config = cx
         .retry
         .as_ref()
@@ -671,7 +678,7 @@ async fn stream_write_of_jsons_with_chucked(
 
                     // Update progress
                     {
-                        error!("successful_writes: {}", successful_writes);
+                        debug!("successful_writes: {}", successful_writes);
                         self.complete_items_count
                             .fetch_add(successful_writes, Ordering::Relaxed);
                         let mut progress_status = self.progress_status.lock().unwrap();
@@ -734,6 +741,7 @@ async fn stream_write_of_jsons_with_chucked(
             select! {
                 _ = rx.recv_many(&mut items, 25) => {
                     // Send batch execution
+                    debug!("{} items are chunked", items.len());
                     let request_items = HashMap::from([(cx.effective_table_name(), items)]);
                     tx2.send(BatchWriteProcess {
                         write_items: request_items,
@@ -748,6 +756,7 @@ async fn stream_write_of_jsons_with_chucked(
                 }
                 _ = terminate_rx.changed() => {
                     // This cancel is safe because a termination signal would send after all items were processed.
+                    info!("chunking process has been terminated");
                     break;
                 }
             }
@@ -766,16 +775,21 @@ async fn stream_write_of_jsons_with_chucked(
         }
     });
 
+    // Start executor
+    let executor_handle = tokio::spawn(async move { executor.run().await });
+
     // Consume all data provided by
     let mut total_items_count: usize = 0;
     for item in iter {
         let item = batch::convert_jsonval_to_hashmap(&item, enable_set_inference);
         let write_request = batch::construct_put_write_request(item);
+        trace!("Send write_request to queue: {:?}", write_request);
         tx.send(write_request)
             .await
             .expect("Unexpected channel close.");
         total_items_count += 1;
     }
+    info!("Queued all items");
     drop(tx);
 
     // Start monitoring the end of the chunking process
@@ -796,10 +810,11 @@ async fn stream_write_of_jsons_with_chucked(
         }
     });
 
-    // Start executor
-    executor.start().await.expect("Failed to handle all writes");
-
     // Wait the termination of the process
+    executor_handle
+        .await
+        .expect("Failed to successfully exit executors")
+        .expect("Failed to wait all workers completions");
     chunking_handle
         .await
         .expect("Failed to wait the chunking process");
@@ -813,6 +828,7 @@ async fn stream_write_of_jsons_with_chucked(
         .await
         .expect_err("Visualization task should be canceled.")
         .is_cancelled());
+
     // Update to latest status
     progress_status
         .lock()
