@@ -59,6 +59,7 @@ impl Bucket {
         assert!(self.cap <= self.max_cap);
     }
 
+    #[cfg(test)]
     pub fn fill(&mut self) {
         self.cap = self.max_cap;
         self.last_filled = Instant::now();
