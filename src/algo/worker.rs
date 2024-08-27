@@ -13,11 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 use crate::algo::bucket::Bucket;
 use crate::algo::monitor::{Monitor, Probe};
 use futures::future::join_all;
+use log::{debug, info, trace};
 use rand::random;
+use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,6 +89,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledWorker<T> {
     }
 
     async fn start(mut self) {
+        debug!("New worker has started");
         while let Some(v) = self.recv.recv().await {
             match v {
                 Signal::Close => break,
@@ -110,6 +112,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledWorker<T> {
                 }
             }
         }
+        debug!("A worker has exited");
     }
 }
 
@@ -134,7 +137,7 @@ const MAX_CLIENT_GENERATION_PER_SECOND: f64 = 10.0;
 
 const SIGMA: f64 = 2.0;
 
-impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledExecutor<T> {
+impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExecutor<T> {
     pub fn new(recv: Receiver<T>, target_limit: f64) -> ThrottledExecutor<T> {
         let (probe, monitor) = Monitor::new(NUM_MONITORING_OBSERVATIONS, NUM_STATS_OBSERVATIONS);
         let mut initial = ThrottledExecutor {
@@ -174,6 +177,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledExecutor<T>
         let mut selected_worker = 0;
 
         while let Some(message) = self.recv.recv().await {
+            trace!("Received new message in a worker: {:?}", message);
+
             let signal = Signal::Process(message);
             let num_workers = self.workers_handle.len();
 
@@ -242,16 +247,20 @@ impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledExecutor<T>
 
     /// Scale out workers.
     async fn scale_out(&mut self, requested_additional_size: usize) {
-        let mut total_size = self.workers_tx.len() + requested_additional_size;
+        let original_size = self.workers_tx.len();
+        let mut total_size = original_size + requested_additional_size;
+
+        info!("Start scaling out from {} to {}", original_size, total_size);
 
         // Saturate total worker
         total_size = total_size.min(self.max_workers());
 
         // Calculate new limit for each worker
         let target_each_worker = self.target_limit / total_size as f64;
+        info!("New target limit each worker: {}", self.target_limit);
 
         // Notify the change of the rate to each worker
-        let mut features = Vec::with_capacity(self.workers_tx.len() * 2);
+        let mut features = Vec::with_capacity(original_size * 2);
         for tx in &self.workers_tx {
             features.push(tx.send(Signal::ChangeMaxCap(target_each_worker)));
             features.push(tx.send(Signal::ChangeRefill(target_each_worker)));
@@ -265,6 +274,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + 'static> ThrottledExecutor<T>
         for _ in 0..requested_additional_size {
             self.create_worker(total_size);
         }
+
+        info!("Scaled out from {} to {}", original_size, total_size)
     }
 }
 

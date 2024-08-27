@@ -364,7 +364,7 @@ pub async fn convert_jsonvals_to_request_items(
 
     for item_jsonval in items_jsonval {
         // Focusing on an item - iterate over attributes in an item.
-        let item = convert_jsonval_to_hashmap(&item_jsonval, enable_set_inference);
+        let item = convert_jsonval_to_hashmap(item_jsonval, enable_set_inference);
 
         // Fill meaningful put_request here, then push it to the write_requests. Then go to the next item.
         write_requests.push(construct_put_write_request(item));

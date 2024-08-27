@@ -55,28 +55,25 @@ pub fn calculate_estimated_attr_size(
     match attr {
         AttributeValue::B(blob) => Ok(blob.as_ref().len()),
         AttributeValue::Bool(_) => Ok(1),
-        AttributeValue::Bs(vec) => Ok(vec
-            .into_iter()
-            .map(|blob| blob.as_ref().len())
-            .sum::<usize>()),
+        AttributeValue::Bs(vec) => Ok(vec.iter().map(|blob| blob.as_ref().len()).sum::<usize>()),
         AttributeValue::L(vec) => Ok(vec
-            .into_iter()
+            .iter()
             .map(|x| calculate_estimated_attr_size(x).map(|s| s + 1))
             .sum::<Result<usize, ItemSizeCalculationError>>()
             .map(|x| x + 3)?),
         AttributeValue::M(vec) => Ok(vec
-            .into_iter()
+            .iter()
             .map(|x| calculate_estimated_attr_size(x.1).map(|s| s + x.0.len() + 1))
             .sum::<Result<usize, ItemSizeCalculationError>>()
             .map(|x| x + 3)?),
         AttributeValue::N(num) => Ok(calc_num_size(num)?),
         AttributeValue::Ns(vec) => Ok(vec
-            .into_iter()
+            .iter()
             .map(|num| calc_num_size(num))
             .sum::<Result<usize, NumberParseError>>()?),
         AttributeValue::Null(_) => Ok(1),
         AttributeValue::S(str) => Ok(str.len()),
-        AttributeValue::Ss(vec) => Ok(vec.into_iter().map(|str| str.len()).sum::<usize>()),
+        AttributeValue::Ss(vec) => Ok(vec.iter().map(|str| str.len()).sum::<usize>()),
         _ => Err(ItemSizeCalculationError::InvalidAttribute),
     }
 }
@@ -124,7 +121,7 @@ fn calc_digits(str: &[u8]) -> Result<(i32, i32), NumberParseError> {
     let mut occur_significant = false;
 
     // Handle empty string
-    if str.len() == 0 {
+    if str.is_empty() {
         return Err(NumberParseError::EmptyString);
     }
 

@@ -14,19 +14,6 @@
  * limitations under the License.
  */
 
-use console::Term;
-use dialoguer::Confirm;
-use log::{debug, error, warn};
-use serde_json::{de::StrRead, Deserializer, StreamDeserializer, Value as JsonValue};
-use std::collections::VecDeque;
-use std::time::Instant;
-use std::{
-    collections::HashMap,
-    fs,
-    io::{Error as IOError, Write},
-    path::Path,
-};
-use std::fmt::Debug;
 use super::batch;
 use super::data;
 use super::ddb::table;
@@ -40,7 +27,23 @@ use aws_sdk_dynamodb::{
     Client as DynamoDbSdkClient,
 };
 use aws_smithy_runtime_api::client::result::SdkError;
+use console::Term;
+use dialoguer::Confirm;
+use log::{debug, error, warn};
+use serde_json::{de::StrRead, Deserializer, StreamDeserializer, Value as JsonValue};
+use std::collections::VecDeque;
+use std::fmt::Debug;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{Error as IOError, Write},
+    path::Path,
+};
 use thiserror::Error;
+use tokio::select;
 
 #[derive(Error, Debug)]
 pub enum DyneinExportError {
@@ -134,6 +137,8 @@ impl ProgressState {
 }
 
 const MAX_NUMBER_OF_OBSERVES: usize = 10;
+
+const VISUALIZE_INTERVAL: Duration = Duration::from_millis(200);
 
 /* =================================================
 Public functions
@@ -321,8 +326,13 @@ pub async fn import(
         None | Some("json") | Some("json-compact") => {
             let array_of_json_obj: Vec<JsonValue> = serde_json::from_str(&input_string)?;
             // TODO: to change configurable
-            stream_write_of_jsons_with_chucked(cx, array_of_json_obj.into_iter(), enable_set_inference, 100.0)
-                .await?;
+            stream_write_of_jsons_with_chucked(
+                cx,
+                array_of_json_obj.into_iter(),
+                enable_set_inference,
+                100.0,
+            )
+            .await?;
         }
         Some("jsonl") => {
             // JSON Lines can be deserialized with into_iter() as below.
@@ -568,7 +578,14 @@ async fn stream_write_of_jsons_with_chucked(
     enable_set_inference: bool,
     max_wcu: f64,
 ) -> Result<(), batch::DyneinBatchError> {
-    let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
+    let progress_status = Arc::new(std::sync::Mutex::new(ProgressState::new(
+        MAX_NUMBER_OF_OBSERVES,
+    )));
+    let complete_items_count = Arc::new(AtomicUsize::new(0));
+
+    // This channel is used to terminate chunking process.
+    // Turning value into true indicates terminating signal.
+    let (terminate_tx, mut terminate_rx) = tokio::sync::watch::channel::<bool>(false);
 
     // This channel is used to queue each write request to a table.
     // Retryable individual items are queued into this queue.
@@ -583,17 +600,19 @@ async fn stream_write_of_jsons_with_chucked(
         .await;
     let ddb = DynamoDbSdkClient::new(&config);
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     struct BatchWriteProcess {
         write_items: HashMap<String, Vec<WriteRequest>>,
         ddb: DynamoDbSdkClient,
         tx_retry: tokio::sync::mpsc::Sender<WriteRequest>,
+        progress_status: Arc<std::sync::Mutex<ProgressState>>,
+        complete_items_count: Arc<AtomicUsize>,
     }
 
     impl algo::worker::ResourceConstraintProcess for BatchWriteProcess {
         fn estimate_resource(&self) -> f64 {
             let mut total_estimate = 0.0;
-            for (_tbl, reqs) in &self.write_items {
+            for reqs in self.write_items.values() {
                 for req in reqs {
                     if let Some(ref put_req) = req.put_request {
                         let bytes = crate::ddb::item::calculate_estimated_item_size(&put_req.item)
@@ -625,6 +644,8 @@ async fn stream_write_of_jsons_with_chucked(
                 .await;
             match result {
                 Ok(output) => {
+                    let failed_writes = output.unprocessed_items.as_ref().map_or(0, |x| x.len());
+
                     // Handle unprocessed_items. They are queued for later retry.
                     if let Some(unprocessed_items) = output.unprocessed_items {
                         for (_, write_requests) in unprocessed_items {
@@ -643,7 +664,19 @@ async fn stream_write_of_jsons_with_chucked(
                         .unwrap_or(vec![])
                         .iter()
                         .map(|x| x.capacity_units.unwrap_or(0.0))
-                        .sum()
+                        .sum();
+
+                    let total_writes: usize = self.write_items.iter().map(|x| x.1.len()).sum();
+                    let successful_writes = total_writes - failed_writes;
+
+                    // Update progress
+                    {
+                        error!("successful_writes: {}", successful_writes);
+                        self.complete_items_count
+                            .fetch_add(successful_writes, Ordering::Relaxed);
+                        let mut progress_status = self.progress_status.lock().unwrap();
+                        progress_status.add_observation(successful_writes);
+                    }
                 }
                 Err(err) => {
                     // Check whether retryable error.
@@ -689,44 +722,103 @@ async fn stream_write_of_jsons_with_chucked(
 
     // This channel is used to queue each a BatchWriteItem request.
     let (tx2, rx2) = tokio::sync::mpsc::channel::<BatchWriteProcess>(16);
-    // TODO: tx2 should be closed after all item are processed.
     let mut executor = algo::worker::ThrottledExecutor::new(rx2, max_wcu);
 
     let cx = cx.clone();
     let tx3 = tx.clone();
-    let handle = tokio::spawn(async move {
+    let status = progress_status.clone();
+    let count = complete_items_count.clone();
+    let chunking_handle = tokio::spawn(async move {
         let mut items = Vec::with_capacity(25);
-        while let Some(item) = rx.recv().await {
-            items.push(item);
-            if items.len() == 25 {
-                let count = items.len();
-
-                // Send batch execution
-                let request_items = HashMap::from([(cx.effective_table_name(), items)]);
-                tx2.send(BatchWriteProcess {
-                    write_items: request_items,
-                    ddb: ddb.clone(),
-                    tx_retry: tx3.clone(),
-                })
-                .await
-                .expect("Failed to pass items to write");
-
-                items = Vec::with_capacity(25);
-                progress_status.add_observation(count);
-                progress_status.show();
+        loop {
+            select! {
+                _ = rx.recv_many(&mut items, 25) => {
+                    // Send batch execution
+                    let request_items = HashMap::from([(cx.effective_table_name(), items)]);
+                    tx2.send(BatchWriteProcess {
+                        write_items: request_items,
+                        ddb: ddb.clone(),
+                        tx_retry: tx3.clone(),
+                        progress_status: status.clone(),
+                        complete_items_count: count.clone(),
+                    })
+                        .await
+                        .expect("Failed to pass items to write");
+                    items = Vec::with_capacity(25);
+                }
+                _ = terminate_rx.changed() => {
+                    // This cancel is safe because a termination signal would send after all items were processed.
+                    break;
+                }
             }
         }
     });
 
+    // Start the background process to show current progress
+    let status = progress_status.clone();
+    let visualize_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(VISUALIZE_INTERVAL).await;
+            {
+                let status = status.lock().unwrap();
+                status.show();
+            }
+        }
+    });
+
+    // Consume all data provided by
+    let mut total_items_count: usize = 0;
     for item in iter {
         let item = batch::convert_jsonval_to_hashmap(&item, enable_set_inference);
         let write_request = batch::construct_put_write_request(item);
         tx.send(write_request)
             .await
-            .expect("Unexpected channel close.")
+            .expect("Unexpected channel close.");
+        total_items_count += 1;
     }
-    handle.await.expect("Failed to queue all items.");
+    drop(tx);
+
+    // Start monitoring the end of the chunking process
+    let monitoring_handle = tokio::spawn(async move {
+        loop {
+            let complete_items_count = complete_items_count.load(Ordering::Relaxed);
+            debug!(
+                "complete_items: {}/{}",
+                complete_items_count, total_items_count
+            );
+            if total_items_count == complete_items_count {
+                terminate_tx
+                    .send(true)
+                    .expect("Failed to terminate the chunking process");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    // Start executor
     executor.start().await.expect("Failed to handle all writes");
+
+    // Wait the termination of the process
+    chunking_handle
+        .await
+        .expect("Failed to wait the chunking process");
+    monitoring_handle
+        .await
+        .expect("Failed to wait the monitoring process");
+
+    // Stop visualization task
+    visualize_handle.abort();
+    assert!(visualize_handle
+        .await
+        .expect_err("Visualization task should be canceled.")
+        .is_cancelled());
+    // Update to latest status
+    progress_status
+        .lock()
+        .expect("Failed to show final progress")
+        .show();
+
     Ok(())
 }
 
