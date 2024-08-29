@@ -29,6 +29,7 @@ use aws_sdk_dynamodb::{
 use aws_smithy_runtime_api::client::result::SdkError;
 use console::Term;
 use dialoguer::Confirm;
+use futures::future::join_all;
 use log::{debug, error, info, trace, warn};
 use serde_json::{de::StrRead, Deserializer, StreamDeserializer, Value as JsonValue};
 use std::collections::VecDeque;
@@ -591,11 +592,11 @@ async fn stream_write_of_jsons_with_chucked(
 
     // This channel is used to terminate chunking process.
     // Turning value into true indicates terminating signal.
-    let (terminate_tx, mut terminate_rx) = tokio::sync::watch::channel::<bool>(false);
+    let (terminate_tx, terminate_rx) = tokio::sync::watch::channel::<bool>(false);
 
     // This channel is used to queue each write request to a table.
     // Retryable individual items are queued into this queue.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteRequest>(BATCH_WRITE_BUFFER_SIZE);
+    let (tx, rx) = async_channel::bounded::<WriteRequest>(BATCH_WRITE_BUFFER_SIZE);
 
     // Setup DynamoDB Client for BatchWriteItem
     let retry_config = cx
@@ -611,7 +612,7 @@ async fn stream_write_of_jsons_with_chucked(
     struct BatchWriteProcess {
         write_items: HashMap<String, Vec<WriteRequest>>,
         ddb: DynamoDbSdkClient,
-        tx_retry: tokio::sync::mpsc::Sender<WriteRequest>,
+        tx_retry: async_channel::Sender<WriteRequest>,
         progress_status: Arc<std::sync::Mutex<ProgressState>>,
         complete_items_count: Arc<AtomicUsize>,
     }
@@ -731,37 +732,79 @@ async fn stream_write_of_jsons_with_chucked(
     let (tx2, rx2) = tokio::sync::mpsc::channel::<BatchWriteProcess>(16);
     let mut executor = algo::worker::ThrottledExecutor::new(rx2, max_wcu);
 
-    let cx = cx.clone();
-    let tx3 = tx.clone();
-    let status = progress_status.clone();
-    let count = complete_items_count.clone();
-    let chunking_handle = tokio::spawn(async move {
-        let mut items = Vec::with_capacity(25);
-        loop {
-            select! {
-                _ = rx.recv_many(&mut items, 25) => {
-                    // Send batch execution
-                    debug!("{} items are chunked", items.len());
-                    let request_items = HashMap::from([(cx.effective_table_name(), items)]);
-                    tx2.send(BatchWriteProcess {
-                        write_items: request_items,
-                        ddb: ddb.clone(),
-                        tx_retry: tx3.clone(),
-                        progress_status: status.clone(),
-                        complete_items_count: count.clone(),
-                    })
-                        .await
-                        .expect("Failed to pass items to write");
-                    items = Vec::with_capacity(25);
-                }
-                _ = terminate_rx.changed() => {
-                    // This cancel is safe because a termination signal would send after all items were processed.
-                    info!("chunking process has been terminated");
-                    break;
+    let mut chunking_handles = Vec::new();
+    for _ in 0..8 {
+        let rx = rx.clone();
+        let cx2 = cx.clone();
+        let tx2 = tx2.clone();
+        let tx3 = tx.clone();
+        let status = progress_status.clone();
+        let count = complete_items_count.clone();
+        let mut terminate_rx = terminate_rx.clone();
+        let ddb = ddb.clone();
+        let chunking_handle = tokio::spawn(async move {
+            let mut items = Vec::with_capacity(25);
+            async fn send_request_content(
+                items: Vec<WriteRequest>,
+                cx: &app::Context,
+                ddb: DynamoDbSdkClient,
+                tx2: &tokio::sync::mpsc::Sender<BatchWriteProcess>,
+                tx3: async_channel::Sender<WriteRequest>,
+                status: Arc<std::sync::Mutex<ProgressState>>,
+                count: Arc<AtomicUsize>,
+            ) -> Vec<WriteRequest> {
+                // Send batch execution
+                debug!("{} items are chunked", items.len());
+                let request_items = HashMap::from([(cx.effective_table_name(), items)]);
+                tx2.send(BatchWriteProcess {
+                    write_items: request_items,
+                    ddb: ddb.clone(),
+                    tx_retry: tx3,
+                    progress_status: status.clone(),
+                    complete_items_count: count.clone(),
+                })
+                .await
+                .expect("Failed to pass items to write");
+                Vec::with_capacity(25)
+            }
+            loop {
+                select! {
+                    msg = rx.recv() => {
+                        match msg {
+                            Ok(req) => {
+                                items.push(req);
+                                if items.len() == 25 {
+                                    items = send_request_content(items, &cx2, ddb.clone(), &tx2, tx3.clone(), status.clone(), count.clone()).await;
+                                }
+                            }
+                            Err(_) => {
+                                // Channel is closed
+                                break;
+                            }
+                        }
+                    }
+                    _ = terminate_rx.changed() => {
+                        // This cancel is safe because a termination signal would send after all items were processed.
+                        info!("chunking process has been terminated");
+                        break;
+                    }
                 }
             }
-        }
-    });
+            if !items.is_empty() {
+                send_request_content(
+                    items,
+                    &cx2,
+                    ddb.clone(),
+                    &tx2,
+                    tx3.clone(),
+                    status.clone(),
+                    count.clone(),
+                )
+                .await;
+            }
+        });
+        chunking_handles.push(chunking_handle);
+    }
 
     // Start the background process to show current progress
     let status = progress_status.clone();
@@ -815,9 +858,8 @@ async fn stream_write_of_jsons_with_chucked(
         .await
         .expect("Failed to successfully exit executors")
         .expect("Failed to wait all workers completions");
-    chunking_handle
-        .await
-        .expect("Failed to wait the chunking process");
+    join_all(chunking_handles).await;
+    //.expect("Failed to wait the chunking process");
     monitoring_handle
         .await
         .expect("Failed to wait the monitoring process");
