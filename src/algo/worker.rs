@@ -137,8 +137,8 @@ pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
 // Even if round trip time is 1s, we can achieve specified WCU with this setting.
 const MINIMUM_WORKER_TARGET_LIMIT: f64 = 1.0;
 
-const NUM_MONITORING_OBSERVATIONS: usize = 64;
-const NUM_STATS_OBSERVATIONS: usize = 64;
+const NUM_MONITORING_OBSERVATIONS: usize = 256;
+const NUM_STATS_OBSERVATIONS: usize = 256;
 const CHANNEL_BUFFER_SIZE: usize = 16;
 
 const MAX_CLIENT_GENERATION_PER_SECOND: f64 = 10.0;

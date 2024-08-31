@@ -136,7 +136,7 @@ impl ProgressState {
     }
 }
 
-const MAX_NUMBER_OF_OBSERVES: usize = 64;
+const MAX_NUMBER_OF_OBSERVES: usize = 256;
 
 const VISUALIZE_INTERVAL: Duration = Duration::from_millis(200);
 
