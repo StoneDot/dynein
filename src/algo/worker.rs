@@ -16,6 +16,7 @@
 use crate::algo::bucket::Bucket;
 use crate::algo::monitor::{Monitor, Probe};
 use futures::future::join_all;
+use itertools::Itertools;
 use log::{debug, info, trace};
 use rand::random;
 use std::fmt::Debug;
@@ -123,6 +124,11 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledWor
     }
 }
 
+struct StatDataPoint {
+    avg: f64,
+    std_dev: f64,
+}
+
 pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
     recv: Receiver<T>,
     workers_tx: Vec<tokio::sync::mpsc::Sender<Signal<T>>>,
@@ -132,6 +138,8 @@ pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
     monitor: Monitor<f64>,
     probe: Probe<f64>,
     latest_scale_out: Instant,
+    achieved_throughput: Vec<(usize, StatDataPoint)>,
+    prev_throughput_idx: usize,
 }
 
 // Even if round trip time is 1s, we can achieve specified WCU with this setting.
@@ -146,6 +154,9 @@ const MAX_CLIENT_GENERATION_PER_SECOND: f64 = 10.0;
 const DEFAULT_MAX_CONCURRENT_CONNECTION: usize = 1000;
 
 const SIGMA: f64 = 3.0;
+
+const SIGMA_CROSS_AVG: f64 = 2.0;
+
 const SCALE_WAIT_FACTOR: f64 = 3.0;
 
 impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExecutor<T> {
@@ -160,6 +171,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             monitor,
             probe,
             latest_scale_out: Instant::now(),
+            achieved_throughput: Vec::new(),
+            prev_throughput_idx: usize::MAX,
         };
         initial.create_worker(1);
         initial
@@ -277,7 +290,21 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             return;
         }
 
+        // Update monitored metrics based on recent data points
+        self.monitor.consume_available_data_points_and_update_metrics();
+
         // Evaluate whether scale out is effective to increase resource consumption
+        if let (Some(avg), Some(std_dev)) = (self.monitor.avg(), self.monitor.std_dev()) {
+            if self.prev_throughput_idx != usize::MAX {
+                let prev_throughput = &self.achieved_throughput[self.prev_throughput_idx].1;
+                if prev_throughput.avg + prev_throughput.std_dev * SIGMA_CROSS_AVG
+                    > avg - std_dev * SIGMA_CROSS_AVG
+                {
+                    // skip scale out decision because previous scale did not have enough effect
+                    return;
+                }
+            }
+        }
 
         // Scale out if resource consumption is not enough
         if self
@@ -321,6 +348,24 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
 
         // Update scale out time
         self.latest_scale_out = Instant::now();
+
+        // Memorize current throughput
+        if let (Some(avg), Some(std_dev)) = (self.monitor.avg(), self.monitor.std_dev()) {
+            self.achieved_throughput
+                .push((original_size, StatDataPoint { avg, std_dev }));
+            self.achieved_throughput
+                .sort_unstable_by(|l, r| l.0.cmp(&r.0));
+            // The below unwrap is always safe because the element inserted in this block
+            self.prev_throughput_idx = self
+                .achieved_throughput
+                .iter()
+                .find_position(|x| x.0 == original_size)
+                .unwrap()
+                .0;
+        }
+
+        // Clear current data points
+        self.monitor.clear_data_points();
 
         info!("Scaled out from {} to {}", original_size, total_size)
     }

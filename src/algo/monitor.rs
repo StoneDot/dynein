@@ -85,7 +85,6 @@ where
     }
 
     pub fn data_less_than_statistically(&mut self, target: f64, sigma: f64) -> bool {
-        self.consume_all();
         if let (Some(std_dev), Some(avg)) = (self.std_dev(), self.avg()) {
             avg + sigma * std_dev < target
         } else {
@@ -93,7 +92,12 @@ where
         }
     }
 
-    fn consume_all(&mut self) {
+    pub fn clear_data_points(&mut self) {
+        self.stat_points.clear();
+        self.observations.clear();
+    }
+
+    pub fn consume_available_data_points_and_update_metrics(&mut self) {
         while let Ok(data_point) = self.rx.try_recv() {
             if self.observations.len() == self.max_recordable_observations {
                 self.observations.pop_back();
@@ -112,7 +116,7 @@ where
         }
     }
 
-    fn avg(&self) -> Option<f64> {
+    pub fn avg(&self) -> Option<f64> {
         // Skip calculation if there is no enough data to calculate average
         if self.stat_points.is_empty() {
             return None;
@@ -121,7 +125,7 @@ where
         Some(self.stat_points.iter().sum::<f64>() / self.stat_points.len() as f64)
     }
 
-    fn std_dev(&self) -> Option<f64> {
+    pub fn std_dev(&self) -> Option<f64> {
         // Skip calculation if there is no enough data to calculate standard deviation
         if self.stat_points.len() <= 1 {
             return None;
