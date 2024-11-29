@@ -731,15 +731,43 @@ async fn stream_write_of_jsons_with_chucked(
     let (tx2, rx2) = tokio::sync::mpsc::channel::<BatchWriteProcess>(16);
     let mut executor = algo::worker::ThrottledExecutor::new(rx2, max_wcu);
 
+    // This channel is used to retry unprocessed items
+    let (tx3, mut rx3) = tokio::sync::mpsc::channel::<WriteRequest>(BATCH_WRITE_BUFFER_SIZE);
+
     let cx = cx.clone();
-    let tx3 = tx.clone();
     let status = progress_status.clone();
     let count = complete_items_count.clone();
     let chunking_handle = tokio::spawn(async move {
         let mut items = Vec::with_capacity(25);
         loop {
+            // Unprocessed items must be handled first to avoid buffer congestion for retry
+            while items.len() < 25 {
+                if let Ok(item) = rx3.try_recv() {
+                    items.push(item);
+                } else {
+                    break;
+                }
+            }
+
+            // There is no room to handle new items
+            if items.len() == 25 {
+                let request_items = HashMap::from([(cx.effective_table_name(), items)]);
+                tx2.send(BatchWriteProcess {
+                    write_items: request_items,
+                    ddb: ddb.clone(),
+                    tx_retry: tx3.clone(),
+                    progress_status: status.clone(),
+                    complete_items_count: count.clone(),
+                }).await
+                    .expect("Failed to pass items to retry");
+                items = Vec::with_capacity(25);
+                continue;
+            }
+
+            // Try to process items that are read from files
+            let num_available_space = 25 - items.len();
             select! {
-                _ = rx.recv_many(&mut items, 25) => {
+                _ = rx.recv_many(&mut items, num_available_space) => {
                     // Send batch execution
                     debug!("{} items are chunked", items.len());
                     let request_items = HashMap::from([(cx.effective_table_name(), items)]);
