@@ -350,32 +350,6 @@ pub async fn batch_write_item(
     Ok(())
 }
 
-/// This function takes cx (just for table name) and Vec<JsonValue>, where this JsonValue consists of multiple items as a standard JSON format,
-///   then returns a HashMap from table name to Vec<WriteRequest>.
-///   The returned HashMap can be used for a value of "RequestItems" parameter in BatchWriteItem API. https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html
-/// Note that this function assumes that target table is only one table.
-pub async fn convert_jsonvals_to_request_items(
-    cx: &app::Context,
-    items_jsonval: &Vec<JsonValue>,
-    enable_set_inference: bool,
-) -> Result<HashMap<String, Vec<WriteRequest>>, DyneinBatchError> {
-    let mut results = HashMap::<String, Vec<WriteRequest>>::new();
-    let mut write_requests = Vec::<WriteRequest>::new();
-
-    for item_jsonval in items_jsonval {
-        // Focusing on an item - iterate over attributes in an item.
-        let item = convert_jsonval_to_hashmap(item_jsonval, enable_set_inference);
-
-        // Fill meaningful put_request here, then push it to the write_requests. Then go to the next item.
-        write_requests.push(construct_put_write_request(item));
-    }
-
-    // A single table name as a key, and insert all (up to 25) write_requests under the single table.
-    results.insert(cx.effective_table_name(), write_requests);
-
-    Ok(results)
-}
-
 pub fn convert_jsonval_to_hashmap(
     json_value: &JsonValue,
     enable_set_inference: bool,
@@ -410,11 +384,10 @@ pub fn construct_put_write_request(item: HashMap<String, AttributeValue>) -> Wri
 ///  [Ami, 23, Orange],
 ///  [Shu, 42, Banana]] ... matrix
 pub async fn csv_matrix_to_request_items(
-    cx: &app::Context,
     matrix: &[Vec<&str>],
     headers: &[&str],
     enable_set_inference: bool,
-) -> Result<HashMap<String, Vec<WriteRequest>>, DyneinBatchError> {
+) -> Result<Vec<WriteRequest>, DyneinBatchError> {
     let total_elements_in_matrix: usize = matrix
         .iter()
         .map(|x| x.len())
@@ -426,7 +399,6 @@ pub async fn csv_matrix_to_request_items(
         std::process::exit(1);
     }
 
-    let mut results = HashMap::<String, Vec<WriteRequest>>::new();
     let mut write_requests = Vec::<WriteRequest>::new();
 
     for cells in matrix {
@@ -452,10 +424,7 @@ pub async fn csv_matrix_to_request_items(
         );
     }
 
-    // A single table name as a key, and insert all (up to 25) write_requests under the single table.
-    results.insert(cx.effective_table_name(), write_requests);
-
-    Ok(results)
+    Ok(write_requests)
 }
 
 /* =================================================

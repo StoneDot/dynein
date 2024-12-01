@@ -330,7 +330,7 @@ pub async fn import(
             let array_of_json_obj: Vec<JsonValue> = serde_json::from_str(&input_string)?;
             info!("End JSON conversion");
             // TODO: to change configurable
-            stream_write_of_jsons_with_chucked(
+            stream_write_of_jsons_with_chunked(
                 cx,
                 array_of_json_obj.into_iter(),
                 enable_set_inference,
@@ -345,8 +345,13 @@ pub async fn import(
             // list_of_jsons contains deserialize results. Filter them and get only valid items.
             let array_of_valid_json_obj: Vec<JsonValue> =
                 array_of_json_obj.filter_map(Result::ok).collect();
-            write_array_of_jsons_with_chunked_25(cx, array_of_valid_json_obj, enable_set_inference)
-                .await?;
+            stream_write_of_jsons_with_chunked(
+                cx,
+                array_of_valid_json_obj.into_iter(),
+                enable_set_inference,
+                100_000.0,
+            )
+            .await?;
         }
         Some("csv") => {
             let lines: Vec<&str> = input_string
@@ -358,24 +363,24 @@ pub async fn import(
             let headers: Vec<&str> = lines[0].split(',').collect::<Vec<&str>>();
             let mut matrix: Vec<Vec<&str>> = vec![];
             // Iterate over lines (from index = 1, as index = 0 is the header line)
-            let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
-            for (i, line) in lines.iter().enumerate().skip(1) {
+            for line in lines.iter().skip(1) {
                 let cells: Vec<&str> = line.split(',').collect::<Vec<&str>>();
                 debug!("splitted line => {:?}", cells);
                 matrix.push(cells);
-                if i % 25 == 0 {
-                    write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
-                    progress_status.add_observation(25);
-                    progress_status.show();
-                    matrix.clear();
-                }
             }
-            debug!("rest of matrix => {:?}", matrix);
-            if !matrix.is_empty() {
-                write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
-                progress_status.add_observation(matrix.len());
-                progress_status.show();
-            }
+
+            let request_items: Vec<WriteRequest> = batch::csv_matrix_to_request_items(
+                matrix.as_slice(),
+                headers.as_slice(),
+                enable_set_inference,
+            )
+            .await?;
+            stream_writes_with_chucked(
+                cx,
+                request_items.into_iter(),
+                100_000.0,
+            )
+            .await?;
         }
         Some(o) => panic!("Invalid input format is given: {}", o),
     }
@@ -559,29 +564,24 @@ fn build_csv_header(
     header_str
 }
 
-async fn write_array_of_jsons_with_chunked_25(
-    cx: &app::Context,
-    array_of_json_obj: Vec<JsonValue>,
-    enable_set_inference: bool,
-) -> Result<(), batch::DyneinBatchError> {
-    let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
-    for chunk /* Vec<JsonValue> */ in array_of_json_obj.chunks(25) { // As BatchWriteItem request can have up to 25 items.
-        let items = chunk.to_vec();
-        let count = items.len();
-        let request_items: HashMap<String, Vec<WriteRequest>> = batch::convert_jsonvals_to_request_items(cx, &items, enable_set_inference).await?;
-        batch::batch_write_until_processed(cx, request_items).await?;
-        progress_status.add_observation(count);
-        progress_status.show();
-    }
-    Ok(())
-}
-
 const BATCH_WRITE_BUFFER_SIZE: usize = 500;
 
-async fn stream_write_of_jsons_with_chucked(
+async fn stream_write_of_jsons_with_chunked(
     cx: &app::Context,
     iter: impl Iterator<Item = JsonValue>,
     enable_set_inference: bool,
+    max_wcu: f64,
+) -> Result<(), batch::DyneinBatchError> {
+    let iter = iter.map(|item| {
+        let item = batch::convert_jsonval_to_hashmap(&item, enable_set_inference);
+        batch::construct_put_write_request(item)
+    });
+    stream_writes_with_chucked(cx, iter.into_iter(), max_wcu).await
+}
+
+async fn stream_writes_with_chucked(
+    cx: &app::Context,
+    iter: impl Iterator<Item = WriteRequest>,
     max_wcu: f64,
 ) -> Result<(), batch::DyneinBatchError> {
     let progress_status = Arc::new(std::sync::Mutex::new(ProgressState::new(
@@ -758,8 +758,9 @@ async fn stream_write_of_jsons_with_chucked(
                     tx_retry: tx3.clone(),
                     progress_status: status.clone(),
                     complete_items_count: count.clone(),
-                }).await
-                    .expect("Failed to pass items to retry");
+                })
+                .await
+                .expect("Failed to pass items to retry");
                 items = Vec::with_capacity(25);
                 continue;
             }
@@ -808,9 +809,7 @@ async fn stream_write_of_jsons_with_chucked(
 
     // Consume all data provided by
     let mut total_items_count: usize = 0;
-    for item in iter {
-        let item = batch::convert_jsonval_to_hashmap(&item, enable_set_inference);
-        let write_request = batch::construct_put_write_request(item);
+    for write_request in iter {
         trace!("Send write_request to queue: {:?}", write_request);
         tx.send(write_request)
             .await
@@ -863,26 +862,6 @@ async fn stream_write_of_jsons_with_chucked(
         .expect("Failed to show final progress")
         .show();
 
-    Ok(())
-}
-
-/// This function takes "matrix" with "headers", builds a parameter for BatchWriteItem, then write it untill they've been processed all.
-/// The "matrix" is a data built from CSV file and each "cell/column" is an attribute of a item.
-///
-/// e.g.
-///    name, age, fruit ... headers
-/// [[John, 12, Apple],
-///  [Ami, 23, Orange],
-///  [Shu, 42, Banana]] ... matrix
-async fn write_csv_matrix(
-    cx: &app::Context,
-    matrix: &[Vec<&str>],
-    headers: &[&str],
-    enable_set_inference: bool,
-) -> Result<(), batch::DyneinBatchError> {
-    let request_items: HashMap<String, Vec<WriteRequest>> =
-        batch::csv_matrix_to_request_items(cx, matrix, headers, enable_set_inference).await?;
-    batch::batch_write_until_processed(cx, request_items).await?;
     Ok(())
 }
 

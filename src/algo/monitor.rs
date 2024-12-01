@@ -84,7 +84,7 @@ where
         (probe, monitor)
     }
 
-    pub fn data_less_than_statistically(&mut self, target: f64, sigma: f64) -> bool {
+    pub fn metric_less_than_statistically(&mut self, target: f64, sigma: f64) -> bool {
         if let (Some(std_dev), Some(avg)) = (self.std_dev(), self.avg()) {
             avg + sigma * std_dev < target
         } else {
@@ -196,7 +196,8 @@ mod tests {
         probe
             .add_observation_with_time(12, first_observation)
             .expect("failed to insert observation");
-        assert!(!monitor.data_less_than_statistically(40.0, 1.0));
+        monitor.consume_available_data_points_and_update_metrics();
+        assert!(!monitor.metric_less_than_statistically(40.0, 1.0));
         assert_eq!(monitor.avg(), None);
         assert_eq!(monitor.std_dev(), None);
 
@@ -204,7 +205,8 @@ mod tests {
         probe
             .add_observation_with_time(10, second_observation)
             .expect("failed to insert observation");
-        assert!(!monitor.data_less_than_statistically(40.0, 1.0));
+        monitor.consume_available_data_points_and_update_metrics();
+        assert!(!monitor.metric_less_than_statistically(40.0, 1.0));
         assert_eq!(monitor.avg(), Some(44.0));
         assert_eq!(monitor.std_dev(), None);
 
@@ -212,7 +214,8 @@ mod tests {
         probe
             .add_observation_with_time(10, third_observation)
             .expect("failed to insert observation");
-        assert!(!monitor.data_less_than_statistically(40.0, 1.0));
+        monitor.consume_available_data_points_and_update_metrics();
+        assert!(!monitor.metric_less_than_statistically(40.0, 1.0));
         assert_eq!(monitor.avg(), Some(38.0));
         assert_delta!(monitor.std_dev().unwrap(), 8.485281374, DELTA);
 
@@ -220,7 +223,8 @@ mod tests {
         probe
             .add_observation_with_time(10, forth_observation)
             .expect("failed to insert observation");
-        assert!(!monitor.data_less_than_statistically(40.0, 1.0));
+        monitor.consume_available_data_points_and_update_metrics();
+        assert!(!monitor.metric_less_than_statistically(40.0, 1.0));
         assert_delta!(monitor.avg().unwrap(), 34.66666667, DELTA);
         assert_delta!(monitor.std_dev().unwrap(), 8.326663998, DELTA);
 
@@ -228,7 +232,8 @@ mod tests {
         probe
             .add_observation_with_time(10, fifth_observation)
             .expect("failed to insert observation");
-        assert!(!monitor.data_less_than_statistically(40.0, 1.0));
+        monitor.consume_available_data_points_and_update_metrics();
+        assert!(!monitor.metric_less_than_statistically(40.0, 1.0));
         assert_delta!(monitor.avg().unwrap(), 32.5, DELTA);
         assert_delta!(monitor.std_dev().unwrap(), 8.062257748, DELTA);
 
@@ -236,7 +241,8 @@ mod tests {
         probe
             .add_observation_with_time(10, sixth_observation)
             .expect("failed to insert observation");
-        assert!(monitor.data_less_than_statistically(40.0, 1.0));
+        monitor.consume_available_data_points_and_update_metrics();
+        assert!(monitor.metric_less_than_statistically(40.0, 1.0));
         assert_delta!(monitor.avg().unwrap(), 30.96, DELTA);
         assert_delta!(monitor.std_dev().unwrap(), 7.785114, DELTA);
     }

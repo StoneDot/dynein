@@ -291,7 +291,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         }
 
         // Update monitored metrics based on recent data points
-        self.monitor.consume_available_data_points_and_update_metrics();
+        self.monitor
+            .consume_available_data_points_and_update_metrics();
 
         // Evaluate whether scale out is effective to increase resource consumption
         if let (Some(avg), Some(std_dev)) = (self.monitor.avg(), self.monitor.std_dev()) {
@@ -309,7 +310,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         // Scale out if resource consumption is not enough
         if self
             .monitor
-            .data_less_than_statistically(self.target_limit, SIGMA)
+            .metric_less_than_statistically(self.target_limit, SIGMA)
             && self.workers_tx.len() < self.max_workers()
         {
             self.scale_out(self.workers_tx.len()).await;
