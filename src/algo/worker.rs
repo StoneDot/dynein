@@ -23,7 +23,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio::task::JoinHandle;
 
@@ -130,11 +130,17 @@ struct StatDataPoint {
 }
 
 pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
+    /// This channel gets a task to proceed with resource constraint
     recv: Receiver<T>,
+    /// Communication channels to each worker
     workers_tx: Vec<tokio::sync::mpsc::Sender<Signal<T>>>,
+    /// Tokio task handles for each worker
     workers_handle: Vec<JoinHandle<()>>,
+    /// This notifier is used to wait worker completion
     notifier: Arc<tokio::sync::Notify>,
+    /// Target resource consumption
     target_limit: f64,
+    /// A monitor of resource consumption
     monitor: Monitor<f64>,
     probe: Probe<f64>,
     latest_scale_out: Instant,
@@ -142,8 +148,10 @@ pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
     prev_throughput_idx: usize,
 }
 
-// Even if round trip time is 1s, we can achieve specified WCU with this setting.
+// Even if round trip time is 1s, we can achieve specified WCU with this setting
+// unless latency is too high.
 const MINIMUM_WORKER_TARGET_LIMIT: f64 = 1.0;
+
 
 const NUM_MONITORING_OBSERVATIONS: usize = 256;
 const NUM_STATS_OBSERVATIONS: usize = 256;
@@ -151,7 +159,7 @@ const CHANNEL_BUFFER_SIZE: usize = 16;
 
 const MAX_CLIENT_GENERATION_PER_SECOND: f64 = 10.0;
 
-const DEFAULT_MAX_CONCURRENT_CONNECTION: usize = 1000;
+const DEFAULT_MAX_CONCURRENT_CONNECTION: usize = 1024;
 
 const SIGMA: f64 = 3.0;
 
@@ -251,12 +259,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         }
 
         // When input channel is closed, all workers should be terminated.
-        let num_workers = self.num_workers();
-        let mut waits = Vec::with_capacity(num_workers);
-        for i in 0..num_workers {
-            waits.push(self.workers_tx[i].send(Signal::Close));
-        }
-        let result = join_all(waits).await;
+        let result = self.terminate_all_workers().await;
 
         // Check whether all workers are terminated successfully.
         let result: Vec<_> = result.into_iter().filter_map(|item| item.err()).collect();
@@ -265,6 +268,15 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         } else {
             Err(result)
         }
+    }
+
+    async fn terminate_all_workers(&mut self) -> Vec<Result<(), SendError<Signal<T>>>> {
+        let num_workers = self.num_workers();
+        let mut waits = Vec::with_capacity(num_workers);
+        for i in 0..num_workers {
+            waits.push(self.workers_tx[i].send(Signal::Close));
+        }
+        join_all(waits).await
     }
 
     fn max_workers(&self) -> usize {

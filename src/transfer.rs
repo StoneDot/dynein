@@ -375,12 +375,7 @@ pub async fn import(
                 enable_set_inference,
             )
             .await?;
-            stream_writes_with_chucked(
-                cx,
-                request_items.into_iter(),
-                100_000.0,
-            )
-            .await?;
+            stream_writes_with_chucked(cx, request_items.into_iter(), 100_000.0).await?;
         }
         Some(o) => panic!("Invalid input format is given: {}", o),
     }
@@ -700,6 +695,7 @@ async fn stream_writes_with_chucked(
                                 | BatchWriteItemError::ProvisionedThroughputExceededException(_)
                                 | BatchWriteItemError::RequestLimitExceeded(_) => {
                                     warn!("BatchWriteItem got retryable error (queued to retry): {}\n{:?}", err.err(), err);
+                                    self.retry_all_items().await;
                                 }
                                 _ => {
                                     // Non-retryable errors
@@ -709,13 +705,23 @@ async fn stream_writes_with_chucked(
                                         err
                                     );
                                     error!("Request ID: {:?}", err.raw().request_id());
+                                    // TODO: Stop the application based on configuration
                                 }
                             }
                         }
+                        SdkError::TimeoutError(err) => {
+                            self.retry_all_items_if_not_first_attempt(err).await;
+                        }
+                        SdkError::DispatchFailure(err) => {
+                            self.retry_all_items_if_not_first_attempt(err).await;
+                        }
+                        SdkError::ResponseError(err) => {
+                            self.retry_all_items_if_not_first_attempt(err).await;
+                        }
                         _ => {
                             // Non-retryable errors.
-                            // We ignore TimeoutError and ResponseError because it may happen due to configuration problem.
                             error!("BatchWriteItem got fatal error: {:?}", err);
+                            // TODO: Stop the application based on configuration
                         }
                     }
                     // Depending on the settings, decide whether to continue or exit
@@ -724,6 +730,33 @@ async fn stream_writes_with_chucked(
                 }
             }
             total_consumed
+        }
+    }
+
+    impl BatchWriteProcess {
+        async fn retry_all_items(&self) {
+            for (_tbl_name, write_requests) in &self.write_items {
+                for write_request in write_requests {
+                    self.tx_retry
+                        .send(write_request.clone())
+                        .await
+                        .expect("Failed to send retry item.");
+                }
+            }
+        }
+
+        async fn retry_all_items_if_not_first_attempt<E: Debug>(&self, err: E) {
+            // We can assume that the network configuration is correct if requests
+            // have been successful previously. In that case, some types of errors are
+            // retryable unless DynamoDB undergoes a significant service issue.
+            if self.complete_items_count.load(Ordering::Relaxed) > 0 {
+                warn!("BatchWriteItem got {:?} (queued to retry)", err);
+                self.retry_all_items().await;
+            } else {
+                // If this is the first attempt, it might be a non-retryable error.
+                error!("BatchWriteItem got {:?} (failed at the first request attempt)", err);
+                // TODO: Add code to terminate application
+            }
         }
     }
 
