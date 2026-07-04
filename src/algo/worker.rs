@@ -186,7 +186,15 @@ const SIGMA_CROSS_AVG: f64 = 2.0;
 const SCALE_WAIT_FACTOR: f64 = 3.0;
 
 impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExecutor<T> {
-    pub fn new(recv: Receiver<T>, target_limit: f64) -> ThrottledExecutor<T> {
+    /// Creates an executor. `target_limit` is the user-specified ceiling of the
+    /// resource consumption. `initial_target` optionally gives a more realistic
+    /// starting point derived from known information (e.g. provisioned capacity);
+    /// when `None`, the executor starts at the ceiling.
+    pub fn new(
+        recv: Receiver<T>,
+        target_limit: f64,
+        initial_target: Option<f64>,
+    ) -> ThrottledExecutor<T> {
         let (probe, monitor) = Monitor::new(NUM_MONITORING_OBSERVATIONS, NUM_STATS_OBSERVATIONS);
         let min_target = MINIMUM_WORKER_TARGET_LIMIT.min(target_limit);
         let mut initial = ThrottledExecutor {
@@ -201,10 +209,20 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             achieved_throughput: Vec::new(),
             prev_throughput_idx: usize::MAX,
             congestion_stats: Arc::new(CongestionStats::default()),
-            congestion: AimdController::new(target_limit, min_target, Instant::now()),
+            congestion: AimdController::with_initial_target(
+                target_limit,
+                initial_target.unwrap_or(target_limit),
+                min_target,
+                Instant::now(),
+            ),
             seen_requests: 0,
             seen_throttled: 0,
         };
+        info!(
+            "Executor starts with the effective target {:.2} (ceiling: {:.2})",
+            initial.congestion.effective_target(),
+            target_limit
+        );
         initial.create_worker(1);
         initial
     }
@@ -345,7 +363,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
                 .on_observation(new_requests, new_throttled, Instant::now())
         {
             info!(
-                "Congestion control changed the effective target to {} (user target: {})",
+                "Congestion control changed the effective target to {:.2} (user target: {:.2})",
                 new_target, self.target_limit
             );
             let target_each_worker = new_target / self.num_workers() as f64;
@@ -359,9 +377,9 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
     }
 
     async fn scale_out_if_needed(&mut self) {
-        // While congestion control is backing off, the target is lowered on
+        // While throttling has been observed recently, the target is lowered on
         // purpose; adding workers would push in the wrong direction.
-        if self.congestion.is_congested() {
+        if self.congestion.is_congested(Instant::now()) {
             return;
         }
 

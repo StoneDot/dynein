@@ -15,6 +15,7 @@
  */
 
 use super::batch;
+use super::control;
 use super::data;
 use super::ddb::table;
 use super::{algo, app};
@@ -324,6 +325,10 @@ pub async fn import(
     };
     info!("Loaded a file");
 
+    // Give the AIMD congestion control a realistic starting point derived from
+    // known table information instead of the (high) user-specified ceiling.
+    let initial_wcu = initial_target_wcu(cx, &ts).await;
+
     match format_str {
         None | Some("json") | Some("json-compact") => {
             info!("Start JSON conversion");
@@ -335,6 +340,7 @@ pub async fn import(
                 array_of_json_obj.into_iter(),
                 enable_set_inference,
                 100_000.0,
+                initial_wcu,
             )
             .await?;
         }
@@ -350,6 +356,7 @@ pub async fn import(
                 array_of_valid_json_obj.into_iter(),
                 enable_set_inference,
                 100_000.0,
+                initial_wcu,
             )
             .await?;
         }
@@ -375,7 +382,8 @@ pub async fn import(
                 enable_set_inference,
             )
             .await?;
-            stream_writes_with_chucked(cx, request_items.into_iter(), 100_000.0).await?;
+            stream_writes_with_chucked(cx, request_items.into_iter(), 100_000.0, initial_wcu)
+                .await?;
         }
         Some(o) => panic!("Invalid input format is given: {}", o),
     }
@@ -561,6 +569,32 @@ fn build_csv_header(
 
 const BATCH_WRITE_BUFFER_SIZE: usize = 500;
 
+/// Ratio applied to the provisioned WCU to decide the initial effective target.
+/// Not starting at 100% leaves room for co-located production workloads from
+/// the beginning; the AIMD recovery then probes for the remaining capacity.
+const INITIAL_TARGET_RATIO_OF_PROVISIONED: f64 = 0.8;
+
+/// The default warm throughput of on-demand tables (4,000 WCU).
+/// The aws-sdk-dynamodb version in use does not expose the `warm_throughput`
+/// field of DescribeTable yet; once the SDK is upgraded, read the actual value
+/// from the table description instead of assuming the platform default.
+const DEFAULT_ON_DEMAND_WARM_WCU: f64 = 4000.0;
+
+/// Decides the initial effective WCU target for AIMD congestion control from
+/// known table information: a ratio of the provisioned capacity, or the
+/// default warm throughput for on-demand tables.
+async fn initial_target_wcu(cx: &app::Context, ts: &app::TableSchema) -> Option<f64> {
+    match ts.mode {
+        table::Mode::Provisioned => {
+            let desc = control::describe_table_api(cx, ts.name.clone()).await;
+            desc.provisioned_throughput
+                .and_then(|p| p.write_capacity_units)
+                .map(|wcu| wcu as f64 * INITIAL_TARGET_RATIO_OF_PROVISIONED)
+        }
+        table::Mode::OnDemand => Some(DEFAULT_ON_DEMAND_WARM_WCU),
+    }
+}
+
 /// Aborts the import when no progress has been made for this long.
 /// This is the safety valve against livelocks (e.g. transport errors retried
 /// forever after the network died); see the design document.
@@ -609,10 +643,8 @@ struct BatchWriteResultSummary {
     /// Total consumed WCU reported by the response.
     consumed_capacity: f64,
     /// Whether this request observed a capacity shortage: the whole request was
-    /// rejected with a throughput/limit error, or the majority of its items came
+    /// rejected with a throughput/limit error, or at least one of its items came
     /// back unprocessed. Used as the congestion signal for AIMD control.
-    /// A small number of unprocessed items is normal at the capacity edge and
-    /// does not count.
     throttled: bool,
 }
 
@@ -666,9 +698,11 @@ fn summarize_batch_write_result(
             BatchWriteResultSummary {
                 successful_items: total_requested - retry_requests.len(),
                 failed_items: 0,
-                // A majority of unprocessed items means the request hit a capacity
-                // shortage; a few of them are normal at the capacity edge.
-                throttled: retry_requests.len() * 2 > total_requested,
+                // Every unprocessed item is a server-side rejection due to a capacity
+                // shortage. To protect co-located production workloads, even a single
+                // one counts as a congestion signal; the decrease cooldown of the AIMD
+                // controller keeps this strictness from over-reacting.
+                throttled: !retry_requests.is_empty(),
                 retry_requests,
                 consumed_capacity,
             }
@@ -741,18 +775,20 @@ async fn stream_write_of_jsons_with_chunked(
     iter: impl Iterator<Item = JsonValue>,
     enable_set_inference: bool,
     max_wcu: f64,
+    initial_wcu: Option<f64>,
 ) -> Result<(), batch::DyneinBatchError> {
     let iter = iter.map(|item| {
         let item = batch::convert_jsonval_to_hashmap(&item, enable_set_inference);
         batch::construct_put_write_request(item)
     });
-    stream_writes_with_chucked(cx, iter.into_iter(), max_wcu).await
+    stream_writes_with_chucked(cx, iter.into_iter(), max_wcu, initial_wcu).await
 }
 
 async fn stream_writes_with_chucked(
     cx: &app::Context,
     iter: impl Iterator<Item = WriteRequest>,
     max_wcu: f64,
+    initial_wcu: Option<f64>,
 ) -> Result<(), batch::DyneinBatchError> {
     let progress_status = Arc::new(std::sync::Mutex::new(ProgressState::new(
         MAX_NUMBER_OF_OBSERVES,
@@ -862,7 +898,7 @@ async fn stream_writes_with_chucked(
 
     // This channel is used to queue each a BatchWriteItem request.
     let (tx2, rx2) = tokio::sync::mpsc::channel::<BatchWriteProcess>(16);
-    let mut executor = algo::worker::ThrottledExecutor::new(rx2, max_wcu);
+    let mut executor = algo::worker::ThrottledExecutor::new(rx2, max_wcu, initial_wcu);
 
     // This channel is used to retry unprocessed items. It must be unbounded to avoid
     // a deadlock: workers enqueue retries while the chunking process may be blocked
@@ -1136,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn test_summarize_minor_unprocessed_items_are_not_congestion() {
+    fn test_summarize_any_unprocessed_item_signals_congestion() {
         let requested = requested_items(&["pk1", "pk2", "pk3"]);
         let unprocessed = HashMap::from([("test-table".to_string(), vec![put_req("pk3")])]);
         let output = BatchWriteItemOutput::builder()
@@ -1145,27 +1181,11 @@ mod tests {
 
         let summary = summarize_batch_write_result(Ok(output), &requested, false);
 
-        // One out of three unprocessed: normal at the capacity edge, not congestion.
-        assert!(!summary.throttled);
-        assert_eq!(summary.retry_requests.len(), 1);
-    }
-
-    #[test]
-    fn test_summarize_majority_unprocessed_items_signal_congestion() {
-        let requested = requested_items(&["pk1", "pk2", "pk3"]);
-        let unprocessed = HashMap::from([(
-            "test-table".to_string(),
-            vec![put_req("pk2"), put_req("pk3")],
-        )]);
-        let output = BatchWriteItemOutput::builder()
-            .set_unprocessed_items(Some(unprocessed))
-            .build();
-
-        let summary = summarize_batch_write_result(Ok(output), &requested, false);
-
-        // The majority of items were rejected: treat it as a congestion signal.
+        // Every unprocessed item is a server-side rejection due to a capacity
+        // shortage. To protect co-located production workloads, even a single
+        // one counts as a congestion signal.
         assert!(summary.throttled);
-        assert_eq!(summary.retry_requests.len(), 2);
+        assert_eq!(summary.retry_requests.len(), 1);
     }
 
     #[test]
