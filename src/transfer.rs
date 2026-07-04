@@ -561,6 +561,127 @@ fn build_csv_header(
 
 const BATCH_WRITE_BUFFER_SIZE: usize = 500;
 
+/// Summary of a single BatchWriteItem call result.
+/// This describes what the caller has to do next: how many items completed,
+/// which requests must be queued again for retry, and how many items failed permanently.
+#[derive(Debug, Default)]
+struct BatchWriteResultSummary {
+    /// Write requests that should be sent again (unprocessed items and retryable errors).
+    retry_requests: Vec<WriteRequest>,
+    /// Number of items successfully written.
+    successful_items: usize,
+    /// Number of items failed permanently (non-retryable errors).
+    failed_items: usize,
+    /// Total consumed WCU reported by the response.
+    consumed_capacity: f64,
+}
+
+/// Classifies the result of a BatchWriteItem call.
+/// Every requested item must be accounted for in exactly one of
+/// `retry_requests`, `successful_items` or `failed_items`, so that the whole
+/// import can neither lose items silently nor wait forever for items nobody retries.
+///
+/// `has_prior_success` tells whether any request has succeeded before this one.
+/// Transport-level errors (timeout, dispatch failure, invalid response) are
+/// retryable once we know the network configuration works, i.e. after the
+/// first success. On the very first attempt they most likely indicate a
+/// configuration problem, so the items are marked as failed instead.
+fn summarize_batch_write_result(
+    result: Result<
+        aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemOutput,
+        SdkError<BatchWriteItemError, aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
+    >,
+    requested_items: &HashMap<String, Vec<WriteRequest>>,
+    has_prior_success: bool,
+) -> BatchWriteResultSummary {
+    let total_requested: usize = requested_items.values().map(|reqs| reqs.len()).sum();
+    let retry_all = BatchWriteResultSummary {
+        retry_requests: requested_items.values().flatten().cloned().collect(),
+        successful_items: 0,
+        failed_items: 0,
+        consumed_capacity: 0.0,
+    };
+    let fail_all = BatchWriteResultSummary {
+        retry_requests: vec![],
+        successful_items: 0,
+        failed_items: total_requested,
+        consumed_capacity: 0.0,
+    };
+    match result {
+        Ok(output) => {
+            let retry_requests: Vec<WriteRequest> = output
+                .unprocessed_items
+                .unwrap_or_default()
+                .into_values()
+                .flatten()
+                .collect();
+            let consumed_capacity = output
+                .consumed_capacity
+                .unwrap_or_default()
+                .iter()
+                .map(|x| x.capacity_units.unwrap_or(0.0))
+                .sum();
+            BatchWriteResultSummary {
+                successful_items: total_requested - retry_requests.len(),
+                failed_items: 0,
+                retry_requests,
+                consumed_capacity,
+            }
+        }
+        // Check whether retryable error.
+        // https://docs.rs/aws-sdk-dynamodb/latest/aws_sdk_dynamodb/enum.Error.html
+        // https://docs.rs/aws-sdk-dynamodb/latest/aws_sdk_dynamodb/operation/batch_write_item/enum.BatchWriteItemError.html
+        //
+        // If it is retryable, all requested items are queued again for retry.
+        // If it is not retryable, all requested items are marked as failed
+        // so that the import can terminate instead of waiting for them forever.
+        Err(SdkError::ServiceError(err)) => match err.err() {
+            BatchWriteItemError::InternalServerError(_)
+            | BatchWriteItemError::ProvisionedThroughputExceededException(_)
+            | BatchWriteItemError::RequestLimitExceeded(_) => {
+                warn!(
+                    "BatchWriteItem got retryable error (queued to retry): {}\n{:?}",
+                    err.err(),
+                    err
+                );
+                retry_all
+            }
+            _ => {
+                // Non-retryable errors
+                error!("BatchWriteItem got fatal error: {}\n{:?}", err.err(), err);
+                error!("Request ID: {:?}", err.raw().request_id());
+                fail_all
+            }
+        },
+        Err(
+            err @ (SdkError::TimeoutError(_)
+            | SdkError::DispatchFailure(_)
+            | SdkError::ResponseError(_)),
+        ) => {
+            // We can assume that the network configuration is correct if requests
+            // have been successful previously. In that case, transport-level errors are
+            // retryable unless DynamoDB undergoes a significant service issue.
+            if has_prior_success {
+                warn!("BatchWriteItem got {:?} (queued to retry)", err);
+                retry_all
+            } else {
+                // If this is the first attempt, it might be a non-retryable error
+                // caused by a configuration problem.
+                error!(
+                    "BatchWriteItem got {:?} (failed at the first request attempt)",
+                    err
+                );
+                fail_all
+            }
+        }
+        Err(err) => {
+            // Non-retryable errors.
+            error!("BatchWriteItem got fatal error: {:?}", err);
+            fail_all
+        }
+    }
+}
+
 async fn stream_write_of_jsons_with_chunked(
     cx: &app::Context,
     iter: impl Iterator<Item = JsonValue>,
@@ -583,6 +704,7 @@ async fn stream_writes_with_chucked(
         MAX_NUMBER_OF_OBSERVES,
     )));
     let complete_items_count = Arc::new(AtomicUsize::new(0));
+    let failed_items_count = Arc::new(AtomicUsize::new(0));
 
     // This channel is used to terminate chunking process.
     // Turning value into true indicates terminating signal.
@@ -606,9 +728,10 @@ async fn stream_writes_with_chucked(
     struct BatchWriteProcess {
         write_items: HashMap<String, Vec<WriteRequest>>,
         ddb: DynamoDbSdkClient,
-        tx_retry: tokio::sync::mpsc::Sender<WriteRequest>,
+        tx_retry: tokio::sync::mpsc::UnboundedSender<WriteRequest>,
         progress_status: Arc<std::sync::Mutex<ProgressState>>,
         complete_items_count: Arc<AtomicUsize>,
+        failed_items_count: Arc<AtomicUsize>,
     }
 
     impl algo::worker::ResourceConstraintProcess for BatchWriteProcess {
@@ -636,7 +759,6 @@ async fn stream_writes_with_chucked(
         }
 
         async fn process_and_consume_resource(&self) -> f64 {
-            let mut total_consumed = 0.0;
             let result = self
                 .ddb
                 .batch_write_item()
@@ -644,119 +766,37 @@ async fn stream_writes_with_chucked(
                 .set_return_consumed_capacity(Some(ReturnConsumedCapacity::Total))
                 .send()
                 .await;
-            match result {
-                Ok(output) => {
-                    let failed_writes = output.unprocessed_items.as_ref().map_or(0, |x| x.len());
 
-                    // Handle unprocessed_items. They are queued for later retry.
-                    if let Some(unprocessed_items) = output.unprocessed_items {
-                        for (_, write_requests) in unprocessed_items {
-                            for write_request in write_requests {
-                                self.tx_retry
-                                    .send(write_request)
-                                    .await
-                                    .expect("Failed to send retry item.");
-                            }
-                        }
-                    }
+            let has_prior_success = self.complete_items_count.load(Ordering::Relaxed) > 0;
+            let summary =
+                summarize_batch_write_result(result, &self.write_items, has_prior_success);
 
-                    // Calculate total consumed WCU/WRU
-                    total_consumed = output
-                        .consumed_capacity
-                        .unwrap_or(vec![])
-                        .iter()
-                        .map(|x| x.capacity_units.unwrap_or(0.0))
-                        .sum();
-
-                    let total_writes: usize = self.write_items.iter().map(|x| x.1.len()).sum();
-                    let successful_writes = total_writes - failed_writes;
-
-                    // Update progress
-                    {
-                        debug!("successful_writes: {}", successful_writes);
-                        self.complete_items_count
-                            .fetch_add(successful_writes, Ordering::Relaxed);
-                        let mut progress_status = self.progress_status.lock().unwrap();
-                        progress_status.add_observation(successful_writes);
-                    }
-                }
-                Err(err) => {
-                    // Check whether retryable error.
-                    // https://docs.rs/aws-sdk-dynamodb/latest/aws_sdk_dynamodb/enum.Error.html
-                    // https://docs.rs/aws-sdk-dynamodb/latest/aws_sdk_dynamodb/operation/batch_write_item/enum.BatchWriteItemError.html
-                    //
-                    // If it is retryable, insert all items into a queue and log warning.
-                    // If it is not retryable, log errors.
-                    // Following the action, whether it continues or exits, is determined based on settings.
-                    match err {
-                        SdkError::ServiceError(err) => {
-                            match err.err() {
-                                BatchWriteItemError::InternalServerError(_)
-                                | BatchWriteItemError::ProvisionedThroughputExceededException(_)
-                                | BatchWriteItemError::RequestLimitExceeded(_) => {
-                                    warn!("BatchWriteItem got retryable error (queued to retry): {}\n{:?}", err.err(), err);
-                                    self.retry_all_items().await;
-                                }
-                                _ => {
-                                    // Non-retryable errors
-                                    error!(
-                                        "BatchWriteItem got fatal error: {}\n{:?}",
-                                        err.err(),
-                                        err
-                                    );
-                                    error!("Request ID: {:?}", err.raw().request_id());
-                                    // TODO: Stop the application based on configuration
-                                }
-                            }
-                        }
-                        SdkError::TimeoutError(err) => {
-                            self.retry_all_items_if_not_first_attempt(err).await;
-                        }
-                        SdkError::DispatchFailure(err) => {
-                            self.retry_all_items_if_not_first_attempt(err).await;
-                        }
-                        SdkError::ResponseError(err) => {
-                            self.retry_all_items_if_not_first_attempt(err).await;
-                        }
-                        _ => {
-                            // Non-retryable errors.
-                            error!("BatchWriteItem got fatal error: {:?}", err);
-                            // TODO: Stop the application based on configuration
-                        }
-                    }
-                    // Depending on the settings, decide whether to continue or exit
-                    // Here, let's assume we log and continue.
-                    // TODO: Write logic
-                }
+            // Queue items for later retry. The retry channel is unbounded so this never
+            // blocks; blocking here can deadlock the whole pipeline because the chunking
+            // process may be waiting for this worker at the same time.
+            for write_request in summary.retry_requests {
+                self.tx_retry
+                    .send(write_request)
+                    .expect("Failed to send retry item.");
             }
-            total_consumed
-        }
-    }
 
-    impl BatchWriteProcess {
-        async fn retry_all_items(&self) {
-            for (_tbl_name, write_requests) in &self.write_items {
-                for write_request in write_requests {
-                    self.tx_retry
-                        .send(write_request.clone())
-                        .await
-                        .expect("Failed to send retry item.");
-                }
+            // Update progress
+            if summary.successful_items > 0 {
+                debug!("successful_writes: {}", summary.successful_items);
+                self.complete_items_count
+                    .fetch_add(summary.successful_items, Ordering::Relaxed);
+                let mut progress_status = self.progress_status.lock().unwrap();
+                progress_status.add_observation(summary.successful_items);
             }
-        }
 
-        async fn retry_all_items_if_not_first_attempt<E: Debug>(&self, err: E) {
-            // We can assume that the network configuration is correct if requests
-            // have been successful previously. In that case, some types of errors are
-            // retryable unless DynamoDB undergoes a significant service issue.
-            if self.complete_items_count.load(Ordering::Relaxed) > 0 {
-                warn!("BatchWriteItem got {:?} (queued to retry)", err);
-                self.retry_all_items().await;
-            } else {
-                // If this is the first attempt, it might be a non-retryable error.
-                error!("BatchWriteItem got {:?} (failed at the first request attempt)", err);
-                // TODO: Add code to terminate application
+            // Items failed with non-retryable errors are also accounted so that
+            // the whole import can terminate (reporting an error at the end).
+            if summary.failed_items > 0 {
+                self.failed_items_count
+                    .fetch_add(summary.failed_items, Ordering::Relaxed);
             }
+
+            summary.consumed_capacity
         }
     }
 
@@ -764,14 +804,21 @@ async fn stream_writes_with_chucked(
     let (tx2, rx2) = tokio::sync::mpsc::channel::<BatchWriteProcess>(16);
     let mut executor = algo::worker::ThrottledExecutor::new(rx2, max_wcu);
 
-    // This channel is used to retry unprocessed items
-    let (tx3, mut rx3) = tokio::sync::mpsc::channel::<WriteRequest>(BATCH_WRITE_BUFFER_SIZE);
+    // This channel is used to retry unprocessed items. It must be unbounded to avoid
+    // a deadlock: workers enqueue retries while the chunking process may be blocked
+    // on sending work to those same workers. The number of queued retries is bounded
+    // by the total number of items anyway.
+    let (tx3, mut rx3) = tokio::sync::mpsc::unbounded_channel::<WriteRequest>();
 
     let cx = cx.clone();
     let status = progress_status.clone();
     let count = complete_items_count.clone();
+    let failed = failed_items_count.clone();
     let chunking_handle = tokio::spawn(async move {
         let mut items = Vec::with_capacity(25);
+        // Becomes false once all input items have been queued and the producer closed
+        // the channel. After that, only the retry channel can deliver items.
+        let mut producer_open = true;
         loop {
             // Unprocessed items must be handled first to avoid buffer congestion for retry
             while items.len() < 25 {
@@ -782,46 +829,60 @@ async fn stream_writes_with_chucked(
                 }
             }
 
-            // There is no room to handle new items
-            if items.len() == 25 {
-                let request_items = HashMap::from([(cx.effective_table_name(), items)]);
-                tx2.send(BatchWriteProcess {
-                    write_items: request_items,
-                    ddb: ddb.clone(),
-                    tx_retry: tx3.clone(),
-                    progress_status: status.clone(),
-                    complete_items_count: count.clone(),
-                })
-                .await
-                .expect("Failed to pass items to retry");
-                items = Vec::with_capacity(25);
+            if items.len() < 25 && producer_open {
+                // Try to fill the rest of the batch with items that are read from files
+                let num_available_space = 25 - items.len();
+                select! {
+                    n = rx.recv_many(&mut items, num_available_space) => {
+                        if n == 0 {
+                            // The producer has queued all input items and dropped the sender.
+                            producer_open = false;
+                        }
+                    }
+                    _ = terminate_rx.changed() => {
+                        // This cancel is safe because a termination signal would send after all items were processed.
+                        info!("chunking process has been terminated");
+                        break;
+                    }
+                }
+            } else if items.is_empty() {
+                // The producer is done and no retry is queued at this moment.
+                // Wait for a next retry item or the termination signal.
+                select! {
+                    received = rx3.recv() => {
+                        match received {
+                            Some(item) => items.push(item),
+                            None => break,
+                        }
+                    }
+                    _ = terminate_rx.changed() => {
+                        // This cancel is safe because a termination signal would send after all items were processed.
+                        info!("chunking process has been terminated");
+                        break;
+                    }
+                }
+                // Give queued retries a chance to fill the batch before sending it.
                 continue;
             }
 
-            // Try to process items that are read from files
-            let num_available_space = 25 - items.len();
-            select! {
-                _ = rx.recv_many(&mut items, num_available_space) => {
-                    // Send batch execution
-                    debug!("{} items are chunked", items.len());
-                    let request_items = HashMap::from([(cx.effective_table_name(), items)]);
-                    tx2.send(BatchWriteProcess {
-                        write_items: request_items,
-                        ddb: ddb.clone(),
-                        tx_retry: tx3.clone(),
-                        progress_status: status.clone(),
-                        complete_items_count: count.clone(),
-                    })
-                        .await
-                        .expect("Failed to pass items to write");
-                    items = Vec::with_capacity(25);
-                }
-                _ = terminate_rx.changed() => {
-                    // This cancel is safe because a termination signal would send after all items were processed.
-                    info!("chunking process has been terminated");
-                    break;
-                }
+            if items.is_empty() {
+                continue;
             }
+
+            // Send batch execution
+            debug!("{} items are chunked", items.len());
+            let request_items = HashMap::from([(cx.effective_table_name(), items)]);
+            tx2.send(BatchWriteProcess {
+                write_items: request_items,
+                ddb: ddb.clone(),
+                tx_retry: tx3.clone(),
+                progress_status: status.clone(),
+                complete_items_count: count.clone(),
+                failed_items_count: failed.clone(),
+            })
+            .await
+            .expect("Failed to pass items to write");
+            items = Vec::with_capacity(25);
         }
     });
 
@@ -852,15 +913,20 @@ async fn stream_writes_with_chucked(
     info!("Queued all items");
     drop(tx);
 
-    // Start monitoring the end of the chunking process
+    // Start monitoring the end of the chunking process.
+    // The process terminates when every item is accounted for: either successfully
+    // written or permanently failed. Items queued for retry belong to neither yet.
+    let complete_count_for_monitor = complete_items_count.clone();
+    let failed_count_for_monitor = failed_items_count.clone();
     let monitoring_handle = tokio::spawn(async move {
         loop {
-            let complete_items_count = complete_items_count.load(Ordering::Relaxed);
+            let complete_items_count = complete_count_for_monitor.load(Ordering::Relaxed);
+            let failed_items_count = failed_count_for_monitor.load(Ordering::Relaxed);
             debug!(
-                "complete_items: {}/{}",
-                complete_items_count, total_items_count
+                "complete_items: {}/{} (failed_items: {})",
+                complete_items_count, total_items_count, failed_items_count
             );
-            if total_items_count == complete_items_count {
+            if total_items_count == complete_items_count + failed_items_count {
                 terminate_tx
                     .send(true)
                     .expect("Failed to terminate the chunking process");
@@ -895,14 +961,157 @@ async fn stream_writes_with_chucked(
         .expect("Failed to show final progress")
         .show();
 
+    // Report items failed with non-retryable errors as an error of the whole import.
+    let failed_items = failed_items_count.load(Ordering::Relaxed);
+    if failed_items > 0 {
+        return Err(batch::DyneinBatchError::PermanentWriteFailure(failed_items));
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemOutput;
+    use aws_sdk_dynamodb::types::error::{
+        ProvisionedThroughputExceededException, ResourceNotFoundException,
+    };
+    use aws_sdk_dynamodb::types::{ConsumedCapacity, PutRequest};
+    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+    use aws_smithy_runtime_api::http::StatusCode;
+    use aws_smithy_types::body::SdkBody;
+    use std::convert::TryFrom;
     use std::ops::Add;
     use std::time::Duration;
+
+    fn put_req(pk: &str) -> WriteRequest {
+        WriteRequest::builder()
+            .put_request(
+                PutRequest::builder()
+                    .item("pk", AttributeValue::S(pk.to_string()))
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+    }
+
+    fn requested_items(pks: &[&str]) -> HashMap<String, Vec<WriteRequest>> {
+        HashMap::from([(
+            "test-table".to_string(),
+            pks.iter().map(|pk| put_req(pk)).collect(),
+        )])
+    }
+
+    fn raw_http_response() -> HttpResponse {
+        HttpResponse::new(StatusCode::try_from(400).unwrap(), SdkBody::from("{}"))
+    }
+
+    fn timeout_error() -> SdkError<BatchWriteItemError, HttpResponse> {
+        SdkError::timeout_error("request timed out")
+    }
+
+    #[test]
+    fn test_summarize_all_items_succeeded() {
+        let requested = requested_items(&["pk1", "pk2", "pk3"]);
+        let output = BatchWriteItemOutput::builder()
+            .consumed_capacity(ConsumedCapacity::builder().capacity_units(5.0).build())
+            .build();
+
+        let summary = summarize_batch_write_result(Ok(output), &requested, false);
+
+        assert_eq!(summary.successful_items, 3);
+        assert_eq!(summary.failed_items, 0);
+        assert!(summary.retry_requests.is_empty());
+        assert_eq!(summary.consumed_capacity, 5.0);
+    }
+
+    #[test]
+    fn test_summarize_unprocessed_items_are_retried() {
+        let requested = requested_items(&["pk1", "pk2", "pk3"]);
+        let unprocessed = HashMap::from([(
+            "test-table".to_string(),
+            vec![put_req("pk2"), put_req("pk3")],
+        )]);
+        let output = BatchWriteItemOutput::builder()
+            .set_unprocessed_items(Some(unprocessed))
+            .consumed_capacity(ConsumedCapacity::builder().capacity_units(1.0).build())
+            .build();
+
+        let summary = summarize_batch_write_result(Ok(output), &requested, false);
+
+        // Two items out of three are unprocessed. They must be retried, not counted as complete.
+        assert_eq!(summary.successful_items, 1);
+        assert_eq!(summary.failed_items, 0);
+        assert_eq!(summary.retry_requests.len(), 2);
+        assert_eq!(summary.consumed_capacity, 1.0);
+    }
+
+    #[test]
+    fn test_summarize_throttled_request_requeues_all_items() {
+        let requested = requested_items(&["pk1", "pk2", "pk3"]);
+        let err = SdkError::service_error(
+            BatchWriteItemError::ProvisionedThroughputExceededException(
+                ProvisionedThroughputExceededException::builder().build(),
+            ),
+            raw_http_response(),
+        );
+
+        // The whole request was throttled. All items must be queued for retry
+        // regardless of prior successes; losing them here makes the import wait
+        // forever for completions that never come.
+        let summary = summarize_batch_write_result(Err(err), &requested, false);
+
+        assert_eq!(summary.successful_items, 0);
+        assert_eq!(summary.failed_items, 0);
+        assert_eq!(summary.retry_requests.len(), 3);
+        assert_eq!(summary.consumed_capacity, 0.0);
+    }
+
+    #[test]
+    fn test_summarize_fatal_service_error_marks_items_failed() {
+        let requested = requested_items(&["pk1", "pk2"]);
+        let err = SdkError::service_error(
+            BatchWriteItemError::ResourceNotFoundException(
+                ResourceNotFoundException::builder().build(),
+            ),
+            raw_http_response(),
+        );
+
+        let summary = summarize_batch_write_result(Err(err), &requested, true);
+
+        // Non-retryable: nothing to retry, but items must still be accounted as failed
+        // so that the import can terminate (with an error) instead of hanging.
+        assert_eq!(summary.successful_items, 0);
+        assert_eq!(summary.failed_items, 2);
+        assert!(summary.retry_requests.is_empty());
+    }
+
+    #[test]
+    fn test_summarize_transport_error_after_success_is_retried() {
+        let requested = requested_items(&["pk1", "pk2"]);
+
+        // The network configuration is proven to work by previous successes,
+        // so a transport-level error is considered transient and retryable.
+        let summary = summarize_batch_write_result(Err(timeout_error()), &requested, true);
+
+        assert_eq!(summary.successful_items, 0);
+        assert_eq!(summary.failed_items, 0);
+        assert_eq!(summary.retry_requests.len(), 2);
+    }
+
+    #[test]
+    fn test_summarize_transport_error_at_first_attempt_marks_items_failed() {
+        let requested = requested_items(&["pk1", "pk2"]);
+
+        // A transport-level error on the very first attempt likely indicates a
+        // configuration problem. Mark items as failed so the import terminates.
+        let summary = summarize_batch_write_result(Err(timeout_error()), &requested, false);
+
+        assert_eq!(summary.successful_items, 0);
+        assert_eq!(summary.failed_items, 2);
+        assert!(summary.retry_requests.is_empty());
+    }
 
     #[test]
     fn test_progress_status() {

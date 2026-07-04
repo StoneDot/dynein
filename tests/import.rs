@@ -272,18 +272,18 @@ async fn create_big_json_if_needed(json_path: &str) -> Result<(), tokio::io::Err
 
     let file = tokio::fs::File::create(path)
         .await
-        .expect(&format!("Failed to create a {}", json_path));
+        .unwrap_or_else(|e| panic!("Failed to create a {}: {}", json_path, e));
     let mut writer = tokio::io::BufWriter::new(file);
-    writer.write(b"[").await?;
+    writer.write_all(b"[").await?;
     for i in 0..NUM_OF_ITEMS {
         writer
-            .write(format!("{{\"pk\":{},\"value\":\"value-{}\"}}", i, i).as_bytes())
+            .write_all(format!("{{\"pk\":{},\"value\":\"value-{}\"}}", i, i).as_bytes())
             .await?;
         if i < NUM_OF_ITEMS - 1 {
-            writer.write(b",\n").await?;
+            writer.write_all(b",\n").await?;
         }
     }
-    writer.write(b"]\n").await?;
+    writer.write_all(b"]\n").await?;
     writer.flush().await?;
 
     Ok(())

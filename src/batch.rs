@@ -41,6 +41,7 @@ pub enum DyneinBatchError {
     BatchWriteError(Box<aws_sdk_dynamodb::error::SdkError<BatchWriteItemError>>),
     InvalidInput(String),
     ParseError(crate::parser::ParseError),
+    PermanentWriteFailure(usize),
 }
 impl fmt::Display for DyneinBatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -50,6 +51,11 @@ impl fmt::Display for DyneinBatchError {
             DyneinBatchError::BatchWriteError(ref e) => e.fmt(f),
             DyneinBatchError::InvalidInput(ref msg) => write!(f, "{}", msg),
             DyneinBatchError::ParseError(ref e) => e.fmt(f),
+            DyneinBatchError::PermanentWriteFailure(count) => write!(
+                f,
+                "{} item(s) could not be written because of non-retryable errors. See error logs for details.",
+                count
+            ),
         }
     }
 }
@@ -61,6 +67,7 @@ impl error::Error for DyneinBatchError {
             DyneinBatchError::BatchWriteError(ref e) => Some(e),
             DyneinBatchError::InvalidInput(_) => None,
             DyneinBatchError::ParseError(_) => None,
+            DyneinBatchError::PermanentWriteFailure(_) => None,
         }
     }
 }
