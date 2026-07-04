@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Multiplicative decrease factor applied to the effective target when
@@ -46,20 +46,35 @@ const RECOVERY_CALM_PERIOD: Duration = Duration::from_secs(60);
 /// jump enormous when running at a low effective target.
 const RECOVERY_STEP_RATIO: f64 = 0.1;
 
+/// Ratio of the estimated available capacity that an informed recovery may
+/// jump to at once. The estimation assumes all capacity unused by other
+/// workloads is ours to take, so only half of it is claimed in one step as a
+/// safety margin against estimation errors and production traffic changes.
+const BOOST_USABLE_RATIO: f64 = 0.5;
+
+/// Micro-unit scale used to accumulate consumed capacity in an atomic counter.
+const CONSUMED_UNIT_SCALE: f64 = 1e6;
+
 /// Lock-free counters shared between workers (producers) and the executor
 /// (consumer) to observe throttling without additional channels.
 #[derive(Debug, Default)]
 pub struct CongestionStats {
     requests: AtomicUsize,
     throttled: AtomicUsize,
+    /// Cumulative consumed capacity in micro-units (see CONSUMED_UNIT_SCALE).
+    consumed_micro: AtomicU64,
 }
 
 impl CongestionStats {
     /// Records the outcome of one processed request.
-    pub fn record(&self, throttled: bool) {
+    pub fn record(&self, throttled: bool, consumed: f64) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         if throttled {
             self.throttled.fetch_add(1, Ordering::Relaxed);
+        }
+        if consumed > 0.0 {
+            self.consumed_micro
+                .fetch_add((consumed * CONSUMED_UNIT_SCALE) as u64, Ordering::Relaxed);
         }
     }
 
@@ -70,6 +85,58 @@ impl CongestionStats {
             self.throttled.load(Ordering::Relaxed),
         )
     }
+
+    /// Returns the cumulative consumed capacity.
+    pub fn consumed(&self) -> f64 {
+        self.consumed_micro.load(Ordering::Relaxed) as f64 / CONSUMED_UNIT_SCALE
+    }
+}
+
+/// A single-value slot carrying the latest safe-target suggestion from the
+/// slow control loop (CloudWatch) to the executor. Overwritten by newer
+/// suggestions; consumed at most once.
+#[derive(Debug)]
+pub struct BoostSlot(AtomicU64);
+
+impl Default for BoostSlot {
+    fn default() -> Self {
+        BoostSlot(AtomicU64::new(f64::NAN.to_bits()))
+    }
+}
+
+impl BoostSlot {
+    /// Stores a new suggestion, replacing any pending one.
+    pub fn suggest(&self, target: f64) {
+        self.0.store(target.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Takes the pending suggestion, leaving the slot empty.
+    pub fn take(&self) -> Option<f64> {
+        let bits = self.0.swap(f64::NAN.to_bits(), Ordering::Relaxed);
+        let value = f64::from_bits(bits);
+        if value.is_nan() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+}
+
+/// Estimates a safe effective target from the table-level consumption
+/// observed via CloudWatch.
+///
+/// The production (non-batch) consumption is inferred by subtracting our own
+/// consumption rate from the table-level consumption rate. The remaining
+/// capacity is considered available to the batch workload, and
+/// `BOOST_USABLE_RATIO` of it may be claimed at once.
+pub fn estimate_safe_target(
+    table_capacity: f64,
+    table_consumed_rate: f64,
+    own_consumed_rate: f64,
+) -> f64 {
+    let production_rate = (table_consumed_rate - own_consumed_rate).max(0.0);
+    let available = (table_capacity - production_rate).max(0.0);
+    available * BOOST_USABLE_RATIO
 }
 
 /// AIMD (additive-increase / multiplicative-decrease) controller for the
@@ -138,6 +205,25 @@ impl AimdController {
             None => false,
             Some(at) => now.duration_since(at) < RECOVERY_CALM_PERIOD,
         }
+    }
+
+    /// Applies an informed upward jump of the effective target, suggested by
+    /// the slow control loop based on observed table-level consumption.
+    ///
+    /// The jump is refused while congestion is ongoing (throttle response
+    /// stays conservative), never lowers the target, and never exceeds the
+    /// user ceiling. Returns `Some(new_effective_target)` when applied.
+    pub fn boost_to(&mut self, safe_target: f64, now: Instant) -> Option<f64> {
+        if self.is_congested(now) {
+            return None;
+        }
+        let new_target = safe_target.min(self.user_target);
+        if new_target <= self.effective_target {
+            return None;
+        }
+        self.calm_since = now;
+        self.effective_target = new_target;
+        Some(new_target)
     }
 
     /// Feeds the number of requests observed since the last call and how many
@@ -332,6 +418,77 @@ mod tests {
         // Fully recovered: further calm periods report no change.
         t = t.add(JUST_AFTER_CALM);
         assert_eq!(c.on_observation(10, 0, t), None);
+    }
+
+    #[test]
+    fn test_congestion_stats_accumulate_consumed_capacity() {
+        let stats = CongestionStats::default();
+        stats.record(false, 1.5);
+        stats.record(true, 2.25);
+        stats.record(false, 0.0);
+        assert_eq!(stats.snapshot(), (3, 1));
+        assert!((stats.consumed() - 3.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_boost_slot_keeps_latest_suggestion() {
+        let slot = BoostSlot::default();
+        assert_eq!(slot.take(), None);
+        slot.suggest(5.0);
+        slot.suggest(7.0);
+        assert_eq!(slot.take(), Some(7.0));
+        assert_eq!(slot.take(), None);
+    }
+
+    #[test]
+    fn test_estimate_safe_target() {
+        // No other workload: half of the capacity may be claimed at once.
+        assert_eq!(estimate_safe_target(10.0, 0.0, 0.0), 5.0);
+        // Table consumes 7, we consume 3 of it: production is 4, available is 6.
+        assert_eq!(estimate_safe_target(10.0, 7.0, 3.0), 3.0);
+        // Our own consumption exceeding the table-level observation (window
+        // misalignment) must not produce a negative production estimate.
+        assert_eq!(estimate_safe_target(10.0, 3.0, 5.0), 5.0);
+        // Production consuming more than the capacity (burst): nothing available.
+        assert_eq!(estimate_safe_target(10.0, 25.0, 5.0), 0.0);
+    }
+
+    #[test]
+    fn test_boost_raises_target_when_calm() {
+        let now = Instant::now();
+        let mut c = controller(now);
+        c.on_observation(10, 1, now);
+        // The congestion has expired; an informed jump is allowed.
+        let t1 = now.add(JUST_AFTER_CALM);
+        assert_eq!(c.boost_to(80.0, t1), Some(80.0));
+        assert_eq!(c.effective_target(), 80.0);
+    }
+
+    #[test]
+    fn test_boost_is_refused_while_congested() {
+        let now = Instant::now();
+        let mut c = controller(now);
+        c.on_observation(10, 1, now);
+        // Throttle response stays conservative: no jump during congestion.
+        let t1 = now.add(Duration::from_secs(5));
+        assert_eq!(c.boost_to(80.0, t1), None);
+        assert_eq!(c.effective_target(), USER_TARGET * 0.5);
+    }
+
+    #[test]
+    fn test_boost_is_capped_at_user_target() {
+        let now = Instant::now();
+        let mut c = AimdController::with_initial_target(USER_TARGET, 40.0, MIN_TARGET, now);
+        assert_eq!(c.boost_to(1000.0, now), Some(USER_TARGET));
+    }
+
+    #[test]
+    fn test_boost_never_lowers_target() {
+        let now = Instant::now();
+        let mut c = AimdController::with_initial_target(USER_TARGET, 40.0, MIN_TARGET, now);
+        assert_eq!(c.boost_to(30.0, now), None);
+        assert_eq!(c.boost_to(40.0, now), None);
+        assert_eq!(c.effective_target(), 40.0);
     }
 
     #[test]

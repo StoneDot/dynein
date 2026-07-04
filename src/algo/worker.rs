@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 use crate::algo::bucket::Bucket;
-use crate::algo::congestion::{AimdController, CongestionStats};
+use crate::algo::congestion::{AimdController, BoostSlot, CongestionStats};
 use crate::algo::monitor::{Monitor, Probe};
 use futures::future::join_all;
 use itertools::Itertools;
@@ -126,7 +126,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledWor
                     self.probe
                         .add_observation(result.consumed)
                         .expect("Failed to insert an observation");
-                    self.congestion_stats.record(result.throttled);
+                    self.congestion_stats
+                        .record(result.throttled, result.consumed);
                     self.bucket.feedback(estimate - result.consumed);
                     self.process_notifier.notify_one();
                 }
@@ -165,6 +166,8 @@ pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
     /// Cumulative counts already consumed from `congestion_stats`
     seen_requests: usize,
     seen_throttled: usize,
+    /// Latest safe-target suggestion from the slow control loop
+    boost_slot: Arc<BoostSlot>,
 }
 
 // Even if round trip time is 1s, we can achieve specified WCU with this setting
@@ -217,6 +220,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             ),
             seen_requests: 0,
             seen_throttled: 0,
+            boost_slot: Arc::new(BoostSlot::default()),
         };
         info!(
             "Executor starts with the effective target {:.2} (ceiling: {:.2})",
@@ -229,6 +233,17 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
 
     fn num_workers(&self) -> usize {
         self.workers_handle.len()
+    }
+
+    /// Shared counters of processed/throttled requests and consumed capacity.
+    /// The slow control loop reads these to estimate our own consumption rate.
+    pub fn congestion_stats(&self) -> Arc<CongestionStats> {
+        self.congestion_stats.clone()
+    }
+
+    /// The slot through which the slow control loop suggests safe targets.
+    pub fn boost_slot(&self) -> Arc<BoostSlot> {
+        self.boost_slot.clone()
     }
 
     fn create_worker(&mut self, target_total_worker_num: usize) {
@@ -346,26 +361,43 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             >= Duration::from_secs_f64(SCALE_WAIT_FACTOR * self.jitter_max_secs(self.num_workers()))
     }
 
-    /// Feeds throttling observations into the AIMD controller and distributes
-    /// the new per-worker rate when the effective target changes.
+    /// Feeds throttling observations into the AIMD controller, applies any
+    /// pending informed jump from the slow control loop, and distributes the
+    /// new per-worker rate when the effective target changes.
     async fn adjust_effective_target(&mut self) {
+        let now = Instant::now();
+        let mut changed: Option<f64> = None;
+
         let (requests, throttled) = self.congestion_stats.snapshot();
         let new_requests = requests - self.seen_requests;
         let new_throttled = throttled - self.seen_throttled;
-        if new_requests == 0 && new_throttled == 0 {
-            return;
+        if new_requests > 0 || new_throttled > 0 {
+            self.seen_requests = requests;
+            self.seen_throttled = throttled;
+            if let Some(new_target) =
+                self.congestion
+                    .on_observation(new_requests, new_throttled, now)
+            {
+                info!(
+                    "Congestion control changed the effective target to {:.2} (user target: {:.2})",
+                    new_target, self.target_limit
+                );
+                changed = Some(new_target);
+            }
         }
-        self.seen_requests = requests;
-        self.seen_throttled = throttled;
 
-        if let Some(new_target) =
-            self.congestion
-                .on_observation(new_requests, new_throttled, Instant::now())
-        {
-            info!(
-                "Congestion control changed the effective target to {:.2} (user target: {:.2})",
-                new_target, self.target_limit
-            );
+        // Apply a pending informed jump from the slow control loop, if any.
+        if let Some(suggested) = self.boost_slot.take() {
+            if let Some(new_target) = self.congestion.boost_to(suggested, now) {
+                info!(
+                    "Slow loop boosted the effective target to {:.2} (user target: {:.2})",
+                    new_target, self.target_limit
+                );
+                changed = Some(new_target);
+            }
+        }
+
+        if let Some(new_target) = changed {
             let target_each_worker = new_target / self.num_workers() as f64;
             let mut futures = Vec::with_capacity(self.workers_tx.len() * 2);
             for tx in &self.workers_tx {

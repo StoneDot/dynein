@@ -325,9 +325,10 @@ pub async fn import(
     };
     info!("Loaded a file");
 
-    // Give the AIMD congestion control a realistic starting point derived from
-    // known table information instead of the (high) user-specified ceiling.
-    let initial_wcu = initial_target_wcu(cx, &ts).await;
+    // Give the AIMD congestion control a realistic starting point and a
+    // capacity reference derived from known table information instead of the
+    // (high) user-specified ceiling.
+    let hints = capacity_hints(cx, &ts).await;
 
     match format_str {
         None | Some("json") | Some("json-compact") => {
@@ -340,7 +341,7 @@ pub async fn import(
                 array_of_json_obj.into_iter(),
                 enable_set_inference,
                 100_000.0,
-                initial_wcu,
+                hints,
             )
             .await?;
         }
@@ -356,7 +357,7 @@ pub async fn import(
                 array_of_valid_json_obj.into_iter(),
                 enable_set_inference,
                 100_000.0,
-                initial_wcu,
+                hints,
             )
             .await?;
         }
@@ -382,8 +383,7 @@ pub async fn import(
                 enable_set_inference,
             )
             .await?;
-            stream_writes_with_chucked(cx, request_items.into_iter(), 100_000.0, initial_wcu)
-                .await?;
+            stream_writes_with_chucked(cx, request_items.into_iter(), 100_000.0, hints).await?;
         }
         Some(o) => panic!("Invalid input format is given: {}", o),
     }
@@ -580,18 +580,137 @@ const INITIAL_TARGET_RATIO_OF_PROVISIONED: f64 = 0.8;
 /// from the table description instead of assuming the platform default.
 const DEFAULT_ON_DEMAND_WARM_WCU: f64 = 4000.0;
 
-/// Decides the initial effective WCU target for AIMD congestion control from
-/// known table information: a ratio of the provisioned capacity, or the
-/// default warm throughput for on-demand tables.
-async fn initial_target_wcu(cx: &app::Context, ts: &app::TableSchema) -> Option<f64> {
+/// Capacity-related hints for congestion control, derived from table information.
+#[derive(Clone, Copy, Debug, Default)]
+struct CapacityHints {
+    /// Initial effective WCU target (a realistic, known-information starting point).
+    initial_wcu: Option<f64>,
+    /// The table's provisioned WCU. Enables the CloudWatch slow control loop,
+    /// which needs a capacity reference to estimate available headroom.
+    provisioned_wcu: Option<f64>,
+}
+
+/// Derives capacity hints for AIMD congestion control from known table
+/// information: a ratio of the provisioned capacity, or the default warm
+/// throughput for on-demand tables.
+async fn capacity_hints(cx: &app::Context, ts: &app::TableSchema) -> CapacityHints {
     match ts.mode {
         table::Mode::Provisioned => {
             let desc = control::describe_table_api(cx, ts.name.clone()).await;
-            desc.provisioned_throughput
+            let provisioned_wcu = desc
+                .provisioned_throughput
                 .and_then(|p| p.write_capacity_units)
-                .map(|wcu| wcu as f64 * INITIAL_TARGET_RATIO_OF_PROVISIONED)
+                .map(|wcu| wcu as f64);
+            CapacityHints {
+                initial_wcu: provisioned_wcu.map(|wcu| wcu * INITIAL_TARGET_RATIO_OF_PROVISIONED),
+                provisioned_wcu,
+            }
         }
-        table::Mode::OnDemand => Some(DEFAULT_ON_DEMAND_WARM_WCU),
+        // The slow loop is not enabled for on-demand tables for now: they have
+        // no clear capacity reference to compute available headroom against.
+        table::Mode::OnDemand => CapacityHints {
+            initial_wcu: Some(DEFAULT_ON_DEMAND_WARM_WCU),
+            provisioned_wcu: None,
+        },
+    }
+}
+
+/// Interval of the slow control loop. Aligned with the CloudWatch metric
+/// granularity; consulting more often cannot observe anything new.
+const SLOW_LOOP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Fetches the latest complete 1-minute datapoint of the table-level consumed
+/// WCU from CloudWatch, as a per-second rate.
+async fn fetch_table_consumed_rate(
+    cw: &aws_sdk_cloudwatch::Client,
+    table_name: &str,
+) -> Result<
+    Option<f64>,
+    SdkError<
+        aws_sdk_cloudwatch::operation::get_metric_statistics::GetMetricStatisticsError,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+> {
+    // Skip the most recent minute: its datapoint may not be complete yet.
+    let end = std::time::SystemTime::now() - Duration::from_secs(60);
+    let start = end - Duration::from_secs(600);
+    let resp = cw
+        .get_metric_statistics()
+        .namespace("AWS/DynamoDB")
+        .metric_name("ConsumedWriteCapacityUnits")
+        .dimensions(
+            aws_sdk_cloudwatch::types::Dimension::builder()
+                .name("TableName")
+                .value(table_name)
+                .build(),
+        )
+        .start_time(aws_smithy_types::DateTime::from(start))
+        .end_time(aws_smithy_types::DateTime::from(end))
+        .period(60)
+        .statistics(aws_sdk_cloudwatch::types::Statistic::Sum)
+        .send()
+        .await?;
+    let latest = resp
+        .datapoints
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d.timestamp.is_some() && d.sum.is_some())
+        .max_by_key(|d| d.timestamp.unwrap().secs());
+    // The datapoint is a 60-second sum; convert it into a per-second rate.
+    Ok(latest.map(|d| d.sum.unwrap() / 60.0))
+}
+
+/// The slow control loop: estimates the production workload from CloudWatch
+/// metrics and suggests a safe target so the executor can recover more
+/// aggressively than the conservative fast-loop recovery when it looks safe.
+/// On a fetch error (e.g. missing CloudWatch permissions), it silently
+/// degrades to the fast loop only.
+async fn slow_control_loop(
+    cw: aws_sdk_cloudwatch::Client,
+    table_name: String,
+    table_capacity: f64,
+    stats: Arc<algo::congestion::CongestionStats>,
+    boost_slot: Arc<algo::congestion::BoostSlot>,
+    mut terminate_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut prev_consumed = stats.consumed();
+    let mut prev_at = Instant::now();
+    loop {
+        select! {
+            _ = tokio::time::sleep(SLOW_LOOP_INTERVAL) => {}
+            _ = terminate_rx.changed() => break,
+        }
+
+        // Our own consumption rate over the last interval.
+        let consumed = stats.consumed();
+        let now = Instant::now();
+        let own_rate = (consumed - prev_consumed) / now.duration_since(prev_at).as_secs_f64();
+        prev_consumed = consumed;
+        prev_at = now;
+
+        match fetch_table_consumed_rate(&cw, &table_name).await {
+            Ok(Some(table_rate)) => {
+                let safe_target =
+                    algo::congestion::estimate_safe_target(table_capacity, table_rate, own_rate);
+                debug!(
+                    "Slow loop: table {:.2} WCU/s, own {:.2} WCU/s -> safe target {:.2}",
+                    table_rate, own_rate, safe_target
+                );
+                boost_slot.suggest(safe_target);
+            }
+            Ok(None) => {
+                debug!("Slow loop: no complete CloudWatch datapoint available yet");
+            }
+            Err(e) => {
+                // Likely missing CloudWatch permissions. Keep importing with
+                // the conservative fast loop only.
+                info!(
+                    "Slow control loop is disabled (failed to fetch CloudWatch metrics): {}",
+                    e
+                );
+                break;
+            }
+        }
     }
 }
 
@@ -775,20 +894,20 @@ async fn stream_write_of_jsons_with_chunked(
     iter: impl Iterator<Item = JsonValue>,
     enable_set_inference: bool,
     max_wcu: f64,
-    initial_wcu: Option<f64>,
+    hints: CapacityHints,
 ) -> Result<(), batch::DyneinBatchError> {
     let iter = iter.map(|item| {
         let item = batch::convert_jsonval_to_hashmap(&item, enable_set_inference);
         batch::construct_put_write_request(item)
     });
-    stream_writes_with_chucked(cx, iter.into_iter(), max_wcu, initial_wcu).await
+    stream_writes_with_chucked(cx, iter.into_iter(), max_wcu, hints).await
 }
 
 async fn stream_writes_with_chucked(
     cx: &app::Context,
     iter: impl Iterator<Item = WriteRequest>,
     max_wcu: f64,
-    initial_wcu: Option<f64>,
+    hints: CapacityHints,
 ) -> Result<(), batch::DyneinBatchError> {
     let progress_status = Arc::new(std::sync::Mutex::new(ProgressState::new(
         MAX_NUMBER_OF_OBSERVES,
@@ -898,7 +1017,24 @@ async fn stream_writes_with_chucked(
 
     // This channel is used to queue each a BatchWriteItem request.
     let (tx2, rx2) = tokio::sync::mpsc::channel::<BatchWriteProcess>(16);
-    let mut executor = algo::worker::ThrottledExecutor::new(rx2, max_wcu, initial_wcu);
+    let mut executor = algo::worker::ThrottledExecutor::new(rx2, max_wcu, hints.initial_wcu);
+
+    // Start the slow control loop when a capacity reference is known. It
+    // consults CloudWatch to recover more aggressively when it looks safe.
+    let slow_loop_handle = if let Some(table_capacity) = hints.provisioned_wcu {
+        let config = cx.effective_sdk_config().await;
+        let cw = aws_sdk_cloudwatch::Client::new(&config);
+        Some(tokio::spawn(slow_control_loop(
+            cw,
+            cx.effective_table_name(),
+            table_capacity,
+            executor.congestion_stats(),
+            executor.boost_slot(),
+            terminate_rx.clone(),
+        )))
+    } else {
+        None
+    };
 
     // This channel is used to retry unprocessed items. It must be unbounded to avoid
     // a deadlock: workers enqueue retries while the chunking process may be blocked
@@ -1060,6 +1196,10 @@ async fn stream_writes_with_chucked(
     monitoring_handle
         .await
         .expect("Failed to wait the monitoring process");
+    if let Some(handle) = slow_loop_handle {
+        // The slow control loop exits on the termination signal sent above.
+        handle.await.expect("Failed to wait the slow control loop");
+    }
 
     // Stop visualization task
     visualize_handle.abort();

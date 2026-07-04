@@ -17,7 +17,7 @@ This document records the design decisions already implemented with their ration
 
 **Non-Goals (for now)**
 
-- Writing to multiple tables at once (but keep the design extensible; see §5.2)
+- Writing to multiple tables at once (but keep the design extensible; see §5.1)
 - Managing GSI capacity individually (same as above)
 
 ## 2. Architecture Overview
@@ -58,14 +58,14 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - **Decision**: the dedicated retry channel is unbounded. On every loop iteration the chunker fills the batch with retries via `try_recv` **first**, and only then tops it up with new items
 - **Deadlock analysis** (the cycle that occurs with a bounded channel):
   a worker blocks on sending a retry → the worker never completes, so the executor's `Notify` never fires → the executor stops draining the process channel → the chunker blocks on sending to the process channel → the chunker stops draining retries → the cycle closes. The more throttling, the higher the retry volume and the more likely this is to occur
-- **Memory argument for unboundedness**: the number of items in the retry queue ≤ the number of items admitted into the pipeline and not yet completed. Currently the whole input file is loaded into memory anyway, so this adds no new upper bound. **When file reading is made streaming, this argument weakens — do that change together with the semaphore admission control of §5.3**
+- **Memory argument for unboundedness**: the number of items in the retry queue ≤ the number of items admitted into the pipeline and not yet completed. Currently the whole input file is loaded into memory anyway, so this adds no new upper bound. **When file reading is made streaming, this argument weakens — do that change together with the semaphore admission control of §5.2**
 - **Intent of drain-retries-first**: backpressure pointed in the direction of "finish the work you have taken in before accepting new work". It keeps the retry queue practically empty and demotes unboundedness to an insurance policy
 - **Rejected alternatives**: bounded + retry-priority (the cycle remains); synchronous in-worker retries (breaks bucket fairness and round-robin)
 
 ### 4.3 Transport errors: "retry after the first success, fail on the first attempt"
 
 - **Decision**: for `TimeoutError` / `DispatchFailure` / `ResponseError`, if at least one request has succeeded before, the network configuration is assumed correct and all items are retried. Failures starting from the very first request most likely indicate a configuration problem, so the items are marked permanently failed and the import terminates
-- **Known hole, now closed**: if the network dies permanently after the first success, the transport-error retries would loop forever (zero progress, no termination). The progress deadline (§4.7) aborts the import in this situation
+- **Known hole, now closed**: if the network dies permanently after the first success, the transport-error retries would loop forever (zero progress, no termination). The progress deadline (§4.8) aborts the import in this situation
 
 ### 4.4 Classification of service errors
 
@@ -75,7 +75,7 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 ### 4.5 Bucket feedback and worker partitioning
 
 - Estimates are consumed up front; the difference against the measured consumption (sum of `consumed_capacity`) is refunded or charged. Introduced as the countermeasure to "wobbly WCU consumption"
-- The executor splits the target rate evenly as `target_limit / num_workers`, and each worker looks only at its own bucket (lock-free). This rests on **the assumption that traffic is uniform across workers**. Multi-table support may make this assumption too strong (§5.5)
+- The executor splits the target rate evenly as `target_limit / num_workers`, and each worker looks only at its own bucket (lock-free). This rests on **the assumption that traffic is uniform across workers**. Multi-table support may make this assumption too strong (§5.3)
 - Scale-out doubles the worker count when measured throughput is statistically (3σ) below the target. `1f2d0a2` added over-scale-out suppression. In addition, scale-out decisions now use the AIMD *effective* target and are frozen entirely while the congestion controller is backing off, which fixes "scaling out in the wrong direction when throttling is the reason the target is missed" (§4.6)
 
 ### 4.6 AIMD congestion control, fast loop (`src/algo/congestion.rs`)
@@ -86,11 +86,22 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - **Initial effective target from known information**: instead of starting blind at the ceiling, `initial_target_wcu()` (transfer.rs) derives a realistic starting point: provisioned tables start at **80% of the provisioned WCU** (leaving headroom for production from the beginning), on-demand tables at the **platform-default warm throughput (4,000 WCU)**. The aws-sdk-dynamodb version in use (1.28) does not expose the `warm_throughput` field of DescribeTable; after an SDK upgrade, read the actual value. The same gradual recovery then probes upward from the initial value toward the ceiling
 - **`is_congested` semantics**: "a throttle event was observed within the last calm period" — used to freeze scale-out. Starting below the ceiling due to an initial target is *not* congestion (otherwise scale-out would be frozen from the start)
 - **Congestion signal definition** (decided in `summarize_batch_write_result`): a request is "throttled" when the whole request was rejected with `ProvisionedThroughputExceededException` / `RequestLimitExceeded`, or when **at least one** of its items came back unprocessed. Every unprocessed item is a server-side rejection due to a capacity shortage, so for production-workload protection even a single one counts (a majority-based threshold was considered and rejected as too lenient). The decrease cooldown keeps this strictness from over-reacting, at the cost of the steady state possibly sitting somewhat below the entitlement — accepted as the intended production-first policy; revisit with benchmark data if it proves too conservative. `InternalServerError` is retryable but is *not* a congestion signal
-- **Wiring**: `ResourceConstraintProcess::process_and_consume_resource` returns `ProcessResult { consumed, throttled }` (the minimal observation-type extension; the keyed generalization of §5.2 remains). Workers record outcomes into `CongestionStats` (two shared atomics — no extra channels); the executor reads deltas on each run-loop iteration, feeds the controller, and broadcasts new per-worker rates via the pre-existing `Signal::ChangeRefill` / `ChangeMaxCap`
+- **Wiring**: `ResourceConstraintProcess::process_and_consume_resource` returns `ProcessResult { consumed, throttled }` (the minimal observation-type extension; the keyed generalization of §5.1 remains). Workers record outcomes into `CongestionStats` (two shared atomics — no extra channels); the executor reads deltas on each run-loop iteration, feeds the controller, and broadcasts new per-worker rates via the pre-existing `Signal::ChangeRefill` / `ChangeMaxCap`
 - **Interaction with scale-out**: decisions compare against the effective target, and scale-out is frozen while congested
-- **Caveat**: the controller only ticks when messages flow through the executor. Under total silence it does not tick, but in that situation there is nothing to pace either; the progress deadline (§4.7) covers pathological cases
+- **Caveat**: the controller only ticks when messages flow through the executor. Under total silence it does not tick, but in that situation there is nothing to pace either; the progress deadline (§4.8) covers pathological cases
 
-### 4.7 Progress deadline (livelock safety valve)
+### 4.7 CloudWatch slow control loop (informed recovery)
+
+- **Intent**: the throttle response stays very conservative (halve immediately, recover at x1.1/min), and the slow loop is the *accelerator that only fires when metrics say it is safe*. Design: estimate the production workload as `table-level ConsumedWriteCapacityUnits rate − our own consumed rate`; the remaining capacity (`provisioned − production`) is assumed fully available to the batch, but only **half of it** (`BOOST_USABLE_RATIO = 0.5`) may be claimed in one jump, as the safety margin against estimation error and production traffic changes
+- **Boost semantics** (`AimdController::boost_to`): upward only, refused while congestion is ongoing (recent throttle), capped at the user ceiling. Suggestions travel through a single-value `BoostSlot` (atomic; latest wins) so the slow loop never blocks the executor
+- **Cadence**: 60-second interval matching the metric granularity, and the most recent minute's datapoint is skipped as potentially incomplete
+- **Degradation**: any CloudWatch fetch error (typically missing permissions) logs once and permanently falls back to the fast loop only
+- **v1 limitations** (recorded deliberately):
+  - Provisioned tables only — on-demand tables lack a clear capacity reference to compute headroom against (revisit once warm throughput is readable after the SDK upgrade)
+  - Window misalignment: our own rate is measured over the last interval while the CloudWatch datapoint is 1–3 minutes old, so the production estimate can skew when our own rate changes quickly. The 0.5 margin absorbs this; a per-minute history of our own consumption would align the windows properly if it proves insufficient
+  - `WriteThrottleEvents` is not consulted yet (could distinguish "production is being throttled" from "we are"); per-GSI metrics wait for the keyed resource model (§5.1)
+
+### 4.8 Progress deadline (livelock safety valve)
 
 - The monitoring task aborts the pipeline when `successful + failed` has not advanced for `STALL_DEADLINE` (300 s), returning `DyneinBatchError::ProgressStalled`. This closes the infinite-retry livelock of §4.3 and any unforeseen stall
 - On abort, workers may still hold in-flight retries whose receiver is gone; those sends now log-and-drop instead of panicking (correct because the import is reporting an error anyway)
@@ -98,13 +109,7 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 
 ## 5. Groundwork for Future Design (not implemented, but direction-setting)
 
-### 5.1 AIMD congestion control, slow loop (CloudWatch; optional, permission-gated)
-
-The fast loop is implemented (§4.6). The remaining piece is the slow loop:
-
-- Estimate the production traffic share from CloudWatch `ConsumedWriteCapacityUnits` / `WriteThrottleEvents` and adjust the target ceiling. With 1-minute granularity and 1–3 minutes delivery delay it cannot serve as primary control. Per-GSI hotspots are only visible in CloudWatch (local throttling errors do not tell you which GSI caused them). Without permissions, silently degrade to the fast loop only
-
-### 5.2 Multi-table / GSI support: vectorizing the resource
+### 5.1 Multi-table / GSI support: vectorizing the resource
 
 - **Current constraint**: resource = scalar f64 is baked into every layer (return values of `ResourceConstraintProcess`, `Bucket`, `Signal`, `Monitor`, the executor target). BatchWriteItem can write to multiple tables in one request, but consumption and throttling are independent per table (+ per GSI)
 - **Direction**: generalize f64 into a lightweight vector type keyed by resource (`Table(name)` / `Gsi(table, index)` → amount). **GSI support just adds more keys**, so the same abstraction covers it automatically (one abstraction removes both TODOs in `bucket.rs` and `worker.rs`)
@@ -112,19 +117,19 @@ The fast loop is implemented (§4.6). The remaining piece is the slow loop:
 - **Groundwork in the transfer layer**: `WriteRequest` flowing through the pipeline carries no table name (the chunker injects the single table name). For multi-table, make the channel element `(table name, WriteRequest)` and let the chunker group by table. This can be changed independently of algo
 - **Consumption semantics**: a request spanning multiple keys consumes atomically only when capacity is sufficient for all keys (all-or-nothing). `estimate_available_at` becomes the max across keys
 
-### 5.3 Semaphore-based admission control (a prerequisite for the streaming-read era)
+### 5.2 Semaphore-based admission control (a prerequisite for the streaming-read era)
 
 - Once file reading becomes streaming, the argument "unbounded retry is safe because everything is in memory anyway" (§4.2) collapses
 - **Direction**: cap the total number of items existing inside the pipeline with a semaphore. Acquire a permit on admission; release it when the item is finally resolved as successful or permanently failed. This keeps the resident population bounded **even with unbounded channels**, reconciling deadlock freedom (unbounded) with a memory cap (semaphore)
 - The retry path merely circulates while holding its permit, so it does not interfere with admission control
 
-### 5.4 Open design question: partitioned buckets vs a shared bucket
+### 5.3 Open design question: partitioned buckets vs a shared bucket
 
 - With multi-table support, evenly-split per-worker buckets (§4.5) additionally require that the table mix flowing to each worker is uniform — a stronger assumption
 - Options: (a) keep the even split and absorb skew via feedback, (b) a shared bucket per table (accurate but contended), (c) per-table worker pools (gives up multi-table batching)
 - **Settle this with experiments.** Until then, have workers query a "capacity provider" abstraction so the design can fall either way
 
-### 5.5 Phase 3 benchmark plan (not executed yet)
+### 5.4 Phase 3 benchmark plan (not executed yet)
 
 - Subject: single mpsc chunker (current) vs 8 parallel async-channel chunkers (`improve-export-import-async-channel-queue`)
 - Metrics: (1) effective throughput, (2) adherence of consumed WCU to the target (moving-window mean ± stddev = quantifying the "wobble"), (3) wasted requests (requests discarded due to throttling), (4) behavior at low WCU / high WCU / varied item sizes
@@ -143,11 +148,11 @@ The fast loop is implemented (§4.6). The remaining piece is the slow loop:
 ## 7. Roadmap
 
 1. ~~Build the experiment environment, reproduce the stall, fix item accounting~~ (done)
-2. ~~Minimal AIMD (fast loop only) + progress deadline + effective-target-based scale-out decisions~~ (done; §4.6, §4.7)
-3. Settle the chunker architecture via benchmark (§5.5) ← next
-4. Foundation generalization: resource vectorization (§5.2), move generic parts of `BatchWriteProcess` into algo, reduce `expect`s, scale-in
-5. Finish import: a `--max-wcu`-style CLI option (currently hardcoded to `100_000.0`), streaming file reads + semaphore admission control (§5.3)
-6. CloudWatch slow loop (§5.1, optional)
+2. ~~Minimal AIMD (fast loop only) + progress deadline + effective-target-based scale-out decisions~~ (done; §4.6, §4.8)
+3. ~~CloudWatch slow control loop (informed recovery)~~ (done; §4.7)
+4. Settle the chunker architecture via benchmark (§5.4) ← next
+5. Foundation generalization: resource vectorization (§5.1), move generic parts of `BatchWriteProcess` into algo, reduce `expect`s, scale-in
+6. Finish import: a `--max-wcu`-style CLI option (currently hardcoded to `100_000.0`), streaming file reads + semaphore admission control (§5.2)
 7. Parallel scan for export (RCU variant, separate branch)
 8. Squash, sign, and tidy up the wip commits
 
