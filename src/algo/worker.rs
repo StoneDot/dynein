@@ -152,7 +152,6 @@ pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
 // unless latency is too high.
 const MINIMUM_WORKER_TARGET_LIMIT: f64 = 1.0;
 
-
 const NUM_MONITORING_OBSERVATIONS: usize = 256;
 const NUM_STATS_OBSERVATIONS: usize = 256;
 const CHANNEL_BUFFER_SIZE: usize = 16;
