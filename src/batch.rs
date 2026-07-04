@@ -42,6 +42,7 @@ pub enum DyneinBatchError {
     InvalidInput(String),
     ParseError(crate::parser::ParseError),
     PermanentWriteFailure(usize),
+    ProgressStalled(usize, usize),
 }
 impl fmt::Display for DyneinBatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -56,6 +57,11 @@ impl fmt::Display for DyneinBatchError {
                 "{} item(s) could not be written because of non-retryable errors. See error logs for details.",
                 count
             ),
+            DyneinBatchError::ProgressStalled(resolved, total) => write!(
+                f,
+                "The import has been aborted because no progress was made for a while ({}/{} items were written). See error logs for details.",
+                resolved, total
+            ),
         }
     }
 }
@@ -68,6 +74,7 @@ impl error::Error for DyneinBatchError {
             DyneinBatchError::InvalidInput(_) => None,
             DyneinBatchError::ParseError(_) => None,
             DyneinBatchError::PermanentWriteFailure(_) => None,
+            DyneinBatchError::ProgressStalled(_, _) => None,
         }
     }
 }

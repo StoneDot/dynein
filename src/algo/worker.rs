@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 use crate::algo::bucket::Bucket;
+use crate::algo::congestion::{AimdController, CongestionStats};
 use crate::algo::monitor::{Monitor, Probe};
 use futures::future::join_all;
 use itertools::Itertools;
@@ -43,6 +44,17 @@ struct ThrottledWorker<T: Clone> {
     process_notifier: Arc<tokio::sync::Notify>,
     bucket: Bucket,
     probe: Probe<f64>,
+    congestion_stats: Arc<CongestionStats>,
+}
+
+/// The outcome of a single resource-consuming process execution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProcessResult {
+    /// The amount of resource actually consumed.
+    pub consumed: f64,
+    /// Whether the process observed a capacity shortage. Used as the
+    /// congestion signal for AIMD control of the effective target.
+    pub throttled: bool,
 }
 
 /// Trait representing a process with resource constraints.
@@ -65,13 +77,10 @@ pub trait ResourceConstraintProcess {
 
     /// Processes and consumes the resource asynchronously.
     ///
-    /// This function asynchronously processes and consumes a resource, returning a `Future` that will eventually resolve to the amount of consumed resource.
-    /// The consumed resource type is determined by the associated type `f64` of the struct implementing this method.
-    ///
-    /// # Returns
-    ///
-    /// The returned future will resolve to an `f64` value representing the consuming the resource.
-    fn process_and_consume_resource(&self) -> impl Future<Output = f64> + Send;
+    /// This function asynchronously processes and consumes a resource, returning a `Future`
+    /// that will eventually resolve to a [`ProcessResult`] carrying the amount of consumed
+    /// resource and whether the process observed a capacity shortage (throttling).
+    fn process_and_consume_resource(&self) -> impl Future<Output = ProcessResult> + Send;
 }
 
 impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledWorker<T> {
@@ -80,12 +89,14 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledWor
         process_notifier: Arc<tokio::sync::Notify>,
         bucket: Bucket,
         probe: Probe<f64>,
+        congestion_stats: Arc<CongestionStats>,
     ) -> ThrottledWorker<T> {
         ThrottledWorker {
             recv,
             process_notifier,
             bucket,
             probe,
+            congestion_stats,
         }
     }
 
@@ -111,11 +122,12 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledWor
                         }
                         tokio::time::sleep_until(self.bucket.estimate_available_at(estimate)).await;
                     }
-                    let actual = p.process_and_consume_resource().await;
+                    let result = p.process_and_consume_resource().await;
                     self.probe
-                        .add_observation(actual)
+                        .add_observation(result.consumed)
                         .expect("Failed to insert an observation");
-                    self.bucket.feedback(estimate - actual);
+                    self.congestion_stats.record(result.throttled);
+                    self.bucket.feedback(estimate - result.consumed);
                     self.process_notifier.notify_one();
                 }
             }
@@ -146,6 +158,13 @@ pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
     latest_scale_out: Instant,
     achieved_throughput: Vec<(usize, StatDataPoint)>,
     prev_throughput_idx: usize,
+    /// Throttling counters shared with the workers
+    congestion_stats: Arc<CongestionStats>,
+    /// AIMD controller deciding the effective target based on throttling
+    congestion: AimdController,
+    /// Cumulative counts already consumed from `congestion_stats`
+    seen_requests: usize,
+    seen_throttled: usize,
 }
 
 // Even if round trip time is 1s, we can achieve specified WCU with this setting
@@ -169,6 +188,7 @@ const SCALE_WAIT_FACTOR: f64 = 3.0;
 impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExecutor<T> {
     pub fn new(recv: Receiver<T>, target_limit: f64) -> ThrottledExecutor<T> {
         let (probe, monitor) = Monitor::new(NUM_MONITORING_OBSERVATIONS, NUM_STATS_OBSERVATIONS);
+        let min_target = MINIMUM_WORKER_TARGET_LIMIT.min(target_limit);
         let mut initial = ThrottledExecutor {
             recv,
             workers_tx: vec![],
@@ -180,6 +200,10 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             latest_scale_out: Instant::now(),
             achieved_throughput: Vec::new(),
             prev_throughput_idx: usize::MAX,
+            congestion_stats: Arc::new(CongestionStats::default()),
+            congestion: AimdController::new(target_limit, min_target, Instant::now()),
+            seen_requests: 0,
+            seen_throttled: 0,
         };
         initial.create_worker(1);
         initial
@@ -190,11 +214,17 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
     }
 
     fn create_worker(&mut self, target_total_worker_num: usize) {
-        let target_limit = self.target_limit / target_total_worker_num as f64;
+        let target_limit = self.congestion.effective_target() / target_total_worker_num as f64;
         let jitter_sec = random::<f64>() * self.jitter_max_secs(target_total_worker_num);
         let (tx, rx) = channel::<Signal<T>>(CHANNEL_BUFFER_SIZE);
         let bucket = Bucket::new(target_limit, target_limit);
-        let worker = ThrottledWorker::new(rx, self.notifier.clone(), bucket, self.probe.clone());
+        let worker = ThrottledWorker::new(
+            rx,
+            self.notifier.clone(),
+            bucket,
+            self.probe.clone(),
+            self.congestion_stats.clone(),
+        );
         self.workers_tx.push(tx);
         self.workers_handle.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs_f64(jitter_sec)).await;
@@ -253,6 +283,9 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
                 self.notifier.notified().await;
             }
 
+            // Adjust the effective target based on observed throttling (AIMD).
+            self.adjust_effective_target().await;
+
             // Scale out if the number of workers is insufficient to achieve the target limit.
             self.scale_out_if_needed().await;
         }
@@ -295,7 +328,43 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             >= Duration::from_secs_f64(SCALE_WAIT_FACTOR * self.jitter_max_secs(self.num_workers()))
     }
 
+    /// Feeds throttling observations into the AIMD controller and distributes
+    /// the new per-worker rate when the effective target changes.
+    async fn adjust_effective_target(&mut self) {
+        let (requests, throttled) = self.congestion_stats.snapshot();
+        let new_requests = requests - self.seen_requests;
+        let new_throttled = throttled - self.seen_throttled;
+        if new_requests == 0 && new_throttled == 0 {
+            return;
+        }
+        self.seen_requests = requests;
+        self.seen_throttled = throttled;
+
+        if let Some(new_target) =
+            self.congestion
+                .on_observation(new_requests, new_throttled, Instant::now())
+        {
+            info!(
+                "Congestion control changed the effective target to {} (user target: {})",
+                new_target, self.target_limit
+            );
+            let target_each_worker = new_target / self.num_workers() as f64;
+            let mut futures = Vec::with_capacity(self.workers_tx.len() * 2);
+            for tx in &self.workers_tx {
+                futures.push(tx.send(Signal::ChangeMaxCap(target_each_worker)));
+                futures.push(tx.send(Signal::ChangeRefill(target_each_worker)));
+            }
+            let _ = join_all(futures).await;
+        }
+    }
+
     async fn scale_out_if_needed(&mut self) {
+        // While congestion control is backing off, the target is lowered on
+        // purpose; adding workers would push in the wrong direction.
+        if self.congestion.is_congested() {
+            return;
+        }
+
         // Wait ramp up time to scale resource consumption
         if !self.elapsed_enough_time_to_scale() {
             return;
@@ -321,7 +390,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         // Scale out if resource consumption is not enough
         if self
             .monitor
-            .metric_less_than_statistically(self.target_limit, SIGMA)
+            .metric_less_than_statistically(self.congestion.effective_target(), SIGMA)
             && self.workers_tx.len() < self.max_workers()
         {
             self.scale_out(self.workers_tx.len()).await;
@@ -339,7 +408,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         total_size = total_size.min(self.max_workers());
 
         // Calculate new limit for each worker
-        let target_each_worker = self.target_limit / total_size as f64;
+        let target_each_worker = self.congestion.effective_target() / total_size as f64;
         info!("New target limit each worker: {}", target_each_worker);
 
         // Notify the change of the rate to each worker
@@ -453,10 +522,15 @@ mod test {
             self.estimate
         }
 
-        fn process_and_consume_resource(&self) -> impl Future<Output = f64> {
+        fn process_and_consume_resource(&self) -> impl Future<Output = ProcessResult> {
             self.tx.send(Message::Consumed).unwrap();
             let v = self.actual;
-            async move { v }
+            async move {
+                ProcessResult {
+                    consumed: v,
+                    throttled: false,
+                }
+            }
         }
     }
 
@@ -465,7 +539,7 @@ mod test {
         let (process, rx) = TestProcess::new(1f64, 2f64);
         assert_eq!(process.estimate_resource(), 1f64);
         assert_timing!(0, 0.1, assert_eq!(rx.recv().unwrap(), Message::Estimated));
-        assert_eq!(process.process_and_consume_resource().await, 2f64);
+        assert_eq!(process.process_and_consume_resource().await.consumed, 2f64);
         assert_timing!(0, 0.1, assert_eq!(rx.recv().unwrap(), Message::Consumed));
     }
 
@@ -477,7 +551,13 @@ mod test {
         bucket.fill();
         // cap = 1
         let (probe, _monitor) = Monitor::new(3, 3);
-        let worker = ThrottledWorker::new(rx, Arc::new(tokio::sync::Notify::new()), bucket, probe);
+        let worker = ThrottledWorker::new(
+            rx,
+            Arc::new(tokio::sync::Notify::new()),
+            bucket,
+            probe,
+            Arc::new(CongestionStats::default()),
+        );
         let handle = tokio::spawn(async move { worker.start().await });
 
         // Consume all capacity immediately

@@ -33,7 +33,7 @@ use log::{debug, error, info, trace, warn};
 use serde_json::{de::StrRead, Deserializer, StreamDeserializer, Value as JsonValue};
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{
@@ -561,6 +561,40 @@ fn build_csv_header(
 
 const BATCH_WRITE_BUFFER_SIZE: usize = 500;
 
+/// Aborts the import when no progress has been made for this long.
+/// This is the safety valve against livelocks (e.g. transport errors retried
+/// forever after the network died); see the design document.
+const STALL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Detects that the pipeline has made no progress for a deadline period.
+/// Pure logic with injected time so the behavior is unit-testable.
+struct StallDetector {
+    deadline: Duration,
+    last_progress: usize,
+    last_change_at: Instant,
+}
+
+impl StallDetector {
+    fn new(deadline: Duration, now: Instant) -> StallDetector {
+        StallDetector {
+            deadline,
+            last_progress: 0,
+            last_change_at: now,
+        }
+    }
+
+    /// Feeds the current progress (resolved item count). Returns true when the
+    /// progress has not advanced for the deadline period.
+    fn observe(&mut self, progress: usize, now: Instant) -> bool {
+        if progress != self.last_progress {
+            self.last_progress = progress;
+            self.last_change_at = now;
+            return false;
+        }
+        now.duration_since(self.last_change_at) >= self.deadline
+    }
+}
+
 /// Summary of a single BatchWriteItem call result.
 /// This describes what the caller has to do next: how many items completed,
 /// which requests must be queued again for retry, and how many items failed permanently.
@@ -574,6 +608,12 @@ struct BatchWriteResultSummary {
     failed_items: usize,
     /// Total consumed WCU reported by the response.
     consumed_capacity: f64,
+    /// Whether this request observed a capacity shortage: the whole request was
+    /// rejected with a throughput/limit error, or the majority of its items came
+    /// back unprocessed. Used as the congestion signal for AIMD control.
+    /// A small number of unprocessed items is normal at the capacity edge and
+    /// does not count.
+    throttled: bool,
 }
 
 /// Classifies the result of a BatchWriteItem call.
@@ -595,17 +635,19 @@ fn summarize_batch_write_result(
     has_prior_success: bool,
 ) -> BatchWriteResultSummary {
     let total_requested: usize = requested_items.values().map(|reqs| reqs.len()).sum();
-    let retry_all = BatchWriteResultSummary {
+    let retry_all = |throttled: bool| BatchWriteResultSummary {
         retry_requests: requested_items.values().flatten().cloned().collect(),
         successful_items: 0,
         failed_items: 0,
         consumed_capacity: 0.0,
+        throttled,
     };
-    let fail_all = BatchWriteResultSummary {
+    let fail_all = || BatchWriteResultSummary {
         retry_requests: vec![],
         successful_items: 0,
         failed_items: total_requested,
         consumed_capacity: 0.0,
+        throttled: false,
     };
     match result {
         Ok(output) => {
@@ -624,6 +666,9 @@ fn summarize_batch_write_result(
             BatchWriteResultSummary {
                 successful_items: total_requested - retry_requests.len(),
                 failed_items: 0,
+                // A majority of unprocessed items means the request hit a capacity
+                // shortage; a few of them are normal at the capacity edge.
+                throttled: retry_requests.len() * 2 > total_requested,
                 retry_requests,
                 consumed_capacity,
             }
@@ -636,21 +681,30 @@ fn summarize_batch_write_result(
         // If it is not retryable, all requested items are marked as failed
         // so that the import can terminate instead of waiting for them forever.
         Err(SdkError::ServiceError(err)) => match err.err() {
-            BatchWriteItemError::InternalServerError(_)
-            | BatchWriteItemError::ProvisionedThroughputExceededException(_)
+            BatchWriteItemError::ProvisionedThroughputExceededException(_)
             | BatchWriteItemError::RequestLimitExceeded(_) => {
                 warn!(
                     "BatchWriteItem got retryable error (queued to retry): {}\n{:?}",
                     err.err(),
                     err
                 );
-                retry_all
+                // Capacity shortage: retry and report congestion.
+                retry_all(true)
+            }
+            BatchWriteItemError::InternalServerError(_) => {
+                warn!(
+                    "BatchWriteItem got retryable error (queued to retry): {}\n{:?}",
+                    err.err(),
+                    err
+                );
+                // Retryable, but a server-side issue rather than a capacity shortage.
+                retry_all(false)
             }
             _ => {
                 // Non-retryable errors
                 error!("BatchWriteItem got fatal error: {}\n{:?}", err.err(), err);
                 error!("Request ID: {:?}", err.raw().request_id());
-                fail_all
+                fail_all()
             }
         },
         Err(
@@ -663,7 +717,7 @@ fn summarize_batch_write_result(
             // retryable unless DynamoDB undergoes a significant service issue.
             if has_prior_success {
                 warn!("BatchWriteItem got {:?} (queued to retry)", err);
-                retry_all
+                retry_all(false)
             } else {
                 // If this is the first attempt, it might be a non-retryable error
                 // caused by a configuration problem.
@@ -671,13 +725,13 @@ fn summarize_batch_write_result(
                     "BatchWriteItem got {:?} (failed at the first request attempt)",
                     err
                 );
-                fail_all
+                fail_all()
             }
         }
         Err(err) => {
             // Non-retryable errors.
             error!("BatchWriteItem got fatal error: {:?}", err);
-            fail_all
+            fail_all()
         }
     }
 }
@@ -758,7 +812,7 @@ async fn stream_writes_with_chucked(
             total_estimate
         }
 
-        async fn process_and_consume_resource(&self) -> f64 {
+        async fn process_and_consume_resource(&self) -> algo::worker::ProcessResult {
             let result = self
                 .ddb
                 .batch_write_item()
@@ -775,9 +829,12 @@ async fn stream_writes_with_chucked(
             // blocks; blocking here can deadlock the whole pipeline because the chunking
             // process may be waiting for this worker at the same time.
             for write_request in summary.retry_requests {
-                self.tx_retry
-                    .send(write_request)
-                    .expect("Failed to send retry item.");
+                if self.tx_retry.send(write_request).is_err() {
+                    // The chunking process has already gone. This only happens while
+                    // the pipeline is aborting (e.g. stall detection), so dropping the
+                    // item is fine: the import is going to report an error anyway.
+                    warn!("Dropped a retry item because the pipeline is shutting down");
+                }
             }
 
             // Update progress
@@ -796,7 +853,10 @@ async fn stream_writes_with_chucked(
                     .fetch_add(summary.failed_items, Ordering::Relaxed);
             }
 
-            summary.consumed_capacity
+            algo::worker::ProcessResult {
+                consumed: summary.consumed_capacity,
+                throttled: summary.throttled,
+            }
         }
     }
 
@@ -916,9 +976,14 @@ async fn stream_writes_with_chucked(
     // Start monitoring the end of the chunking process.
     // The process terminates when every item is accounted for: either successfully
     // written or permanently failed. Items queued for retry belong to neither yet.
+    // As a safety valve against livelocks, it also aborts the pipeline when no
+    // progress has been made for STALL_DEADLINE.
     let complete_count_for_monitor = complete_items_count.clone();
     let failed_count_for_monitor = failed_items_count.clone();
+    let stalled = Arc::new(AtomicBool::new(false));
+    let stalled_for_monitor = stalled.clone();
     let monitoring_handle = tokio::spawn(async move {
+        let mut stall_detector = StallDetector::new(STALL_DEADLINE, Instant::now());
         loop {
             let complete_items_count = complete_count_for_monitor.load(Ordering::Relaxed);
             let failed_items_count = failed_count_for_monitor.load(Ordering::Relaxed);
@@ -926,7 +991,19 @@ async fn stream_writes_with_chucked(
                 "complete_items: {}/{} (failed_items: {})",
                 complete_items_count, total_items_count, failed_items_count
             );
-            if total_items_count == complete_items_count + failed_items_count {
+            let resolved_items = complete_items_count + failed_items_count;
+            if total_items_count == resolved_items {
+                terminate_tx
+                    .send(true)
+                    .expect("Failed to terminate the chunking process");
+                break;
+            }
+            if stall_detector.observe(resolved_items, Instant::now()) {
+                error!(
+                    "No progress has been made for {:?}; aborting the import",
+                    STALL_DEADLINE
+                );
+                stalled_for_monitor.store(true, Ordering::Relaxed);
                 terminate_tx
                     .send(true)
                     .expect("Failed to terminate the chunking process");
@@ -960,6 +1037,16 @@ async fn stream_writes_with_chucked(
         .lock()
         .expect("Failed to show final progress")
         .show();
+
+    // The stall abort takes precedence: items neither written nor failed remain.
+    if stalled.load(Ordering::Relaxed) {
+        let resolved_items = complete_items_count.load(Ordering::Relaxed)
+            + failed_items_count.load(Ordering::Relaxed);
+        return Err(batch::DyneinBatchError::ProgressStalled(
+            resolved_items,
+            total_items_count,
+        ));
+    }
 
     // Report items failed with non-retryable errors as an error of the whole import.
     let failed_items = failed_items_count.load(Ordering::Relaxed);
@@ -1024,6 +1111,7 @@ mod tests {
         assert_eq!(summary.failed_items, 0);
         assert!(summary.retry_requests.is_empty());
         assert_eq!(summary.consumed_capacity, 5.0);
+        assert!(!summary.throttled);
     }
 
     #[test]
@@ -1048,6 +1136,61 @@ mod tests {
     }
 
     #[test]
+    fn test_summarize_minor_unprocessed_items_are_not_congestion() {
+        let requested = requested_items(&["pk1", "pk2", "pk3"]);
+        let unprocessed = HashMap::from([("test-table".to_string(), vec![put_req("pk3")])]);
+        let output = BatchWriteItemOutput::builder()
+            .set_unprocessed_items(Some(unprocessed))
+            .build();
+
+        let summary = summarize_batch_write_result(Ok(output), &requested, false);
+
+        // One out of three unprocessed: normal at the capacity edge, not congestion.
+        assert!(!summary.throttled);
+        assert_eq!(summary.retry_requests.len(), 1);
+    }
+
+    #[test]
+    fn test_summarize_majority_unprocessed_items_signal_congestion() {
+        let requested = requested_items(&["pk1", "pk2", "pk3"]);
+        let unprocessed = HashMap::from([(
+            "test-table".to_string(),
+            vec![put_req("pk2"), put_req("pk3")],
+        )]);
+        let output = BatchWriteItemOutput::builder()
+            .set_unprocessed_items(Some(unprocessed))
+            .build();
+
+        let summary = summarize_batch_write_result(Ok(output), &requested, false);
+
+        // The majority of items were rejected: treat it as a congestion signal.
+        assert!(summary.throttled);
+        assert_eq!(summary.retry_requests.len(), 2);
+    }
+
+    #[test]
+    fn test_stall_detector() {
+        let deadline = Duration::from_secs(10);
+        let now = Instant::now();
+        let mut detector = StallDetector::new(deadline, now);
+
+        // Progress is advancing: never stalled.
+        assert!(!detector.observe(10, now.add(Duration::from_secs(9))));
+        assert!(!detector.observe(20, now.add(Duration::from_secs(18))));
+
+        // No progress, but the deadline has not passed since the last advance.
+        assert!(!detector.observe(20, now.add(Duration::from_secs(27))));
+
+        // No progress for the full deadline period since the last advance (t=18).
+        assert!(detector.observe(20, now.add(Duration::from_secs(28))));
+
+        // Progress resumes: the clock resets.
+        assert!(!detector.observe(21, now.add(Duration::from_secs(29))));
+        assert!(!detector.observe(21, now.add(Duration::from_secs(38))));
+        assert!(detector.observe(21, now.add(Duration::from_secs(39))));
+    }
+
+    #[test]
     fn test_summarize_throttled_request_requeues_all_items() {
         let requested = requested_items(&["pk1", "pk2", "pk3"]);
         let err = SdkError::service_error(
@@ -1066,6 +1209,7 @@ mod tests {
         assert_eq!(summary.failed_items, 0);
         assert_eq!(summary.retry_requests.len(), 3);
         assert_eq!(summary.consumed_capacity, 0.0);
+        assert!(summary.throttled);
     }
 
     #[test]

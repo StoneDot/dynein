@@ -65,7 +65,7 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 ### 4.3 Transport errors: "retry after the first success, fail on the first attempt"
 
 - **Decision**: for `TimeoutError` / `DispatchFailure` / `ResponseError`, if at least one request has succeeded before, the network configuration is assumed correct and all items are retried. Failures starting from the very first request most likely indicate a configuration problem, so the items are marked permanently failed and the import terminates
-- **Known hole (not addressed yet)**: if the network dies permanently after the first success, we get an infinite-retry livelock (zero progress, no termination). The countermeasure is a deadline safety valve — "abort when there is zero progress for a certain period" (§5.4) — planned to land together with AIMD
+- **Known hole, now closed**: if the network dies permanently after the first success, the transport-error retries would loop forever (zero progress, no termination). The progress deadline (§4.7) aborts the import in this situation
 
 ### 4.4 Classification of service errors
 
@@ -76,19 +76,30 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 
 - Estimates are consumed up front; the difference against the measured consumption (sum of `consumed_capacity`) is refunded or charged. Introduced as the countermeasure to "wobbly WCU consumption"
 - The executor splits the target rate evenly as `target_limit / num_workers`, and each worker looks only at its own bucket (lock-free). This rests on **the assumption that traffic is uniform across workers**. Multi-table support may make this assumption too strong (§5.5)
-- Scale-out doubles the worker count when measured throughput is statistically (3σ) below the target. `1f2d0a2` added over-scale-out suppression, but **the fundamental fix for "scaling out in the wrong direction when throttling is the reason the target is missed" belongs to the AIMD side** (§5.1)
+- Scale-out doubles the worker count when measured throughput is statistically (3σ) below the target. `1f2d0a2` added over-scale-out suppression. In addition, scale-out decisions now use the AIMD *effective* target and are frozen entirely while the congestion controller is backing off, which fixes "scaling out in the wrong direction when throttling is the reason the target is missed" (§4.6)
+
+### 4.6 AIMD congestion control, fast loop (`src/algo/congestion.rs`)
+
+- **Requirement**: co-located production workloads take priority. When throttling occurs, the batch-side target temporarily drops to roughly half
+- **Controller**: `AimdController` is pure logic with injected time (fully unit-tested). The user target is a ceiling; on a congestion signal the effective target is multiplicatively halved (with a cooldown so one congestion event causes one decrease), and after a calm period it recovers additively (10% of the user target per period)
+- **Congestion signal definition** (decided in `summarize_batch_write_result`): a request is "throttled" when the whole request was rejected with `ProvisionedThroughputExceededException` / `RequestLimitExceeded`, or when **the majority** of its items came back unprocessed. A few unprocessed items are normal at the capacity edge and deliberately do not count. `InternalServerError` is retryable but is *not* a congestion signal
+- **Wiring**: `ResourceConstraintProcess::process_and_consume_resource` returns `ProcessResult { consumed, throttled }` (the minimal observation-type extension; the keyed generalization of §5.2 remains). Workers record outcomes into `CongestionStats` (two shared atomics — no extra channels); the executor reads deltas on each run-loop iteration, feeds the controller, and broadcasts new per-worker rates via the pre-existing `Signal::ChangeRefill` / `ChangeMaxCap`
+- **Interaction with scale-out**: decisions compare against the effective target, and scale-out is frozen while congested
+- **Caveat**: the controller only ticks when messages flow through the executor. Under total silence it does not tick, but in that situation there is nothing to pace either; the progress deadline (§4.7) covers pathological cases
+
+### 4.7 Progress deadline (livelock safety valve)
+
+- The monitoring task aborts the pipeline when `successful + failed` has not advanced for `STALL_DEADLINE` (300 s), returning `DyneinBatchError::ProgressStalled`. This closes the infinite-retry livelock of §4.3 and any unforeseen stall
+- On abort, workers may still hold in-flight retries whose receiver is gone; those sends now log-and-drop instead of panicking (correct because the import is reporting an error anyway)
+- `StallDetector` is pure logic with injected time (unit-tested)
 
 ## 5. Groundwork for Future Design (not implemented, but direction-setting)
 
-### 5.1 AIMD congestion control (next implementation target)
+### 5.1 AIMD congestion control, slow loop (CloudWatch; optional, permission-gated)
 
-- **Requirement**: co-located production workloads take priority. When throttling occurs, it is acceptable for the batch-side target to temporarily drop to roughly half
-- **Design**: two control loops
-  - **Fast loop (primary control)**: locally observed throttling rate. When it crosses a threshold, multiplicatively halve `effective_target` (clipped at a floor); recover additively while calm. The existing `Signal::ChangeRefill` / `ChangeMaxCap` can be used as-is to distribute rate changes
-  - **Slow loop (optional, permission-gated)**: estimate the production traffic share from CloudWatch `ConsumedWriteCapacityUnits` / `WriteThrottleEvents` and adjust the target ceiling. With 1-minute granularity and 1–3 minutes delivery delay it cannot serve as primary control. Per-GSI hotspots are only visible in CloudWatch (local throttling errors do not tell you which GSI caused them). Without permissions, silently degrade to the fast loop only
-- **Wiring needed**: a backchannel for throttling events from workers to the executor. `Probe` currently only carries the consumed amount as f64, so widen the observation type to something like `{consumed, throttled}` (this touches the same spot as the type generalization of §5.2, so do only the observation-type extension first)
-- **Scale-out decisions** must switch from the raw target to `effective_target`, and worker additions must be frozen while the congestion window is lowered
-- Once this lands, the "retry storm caused by the bucket refunding the full estimate on errors and retrying immediately" problem is effectively resolved as well (the lowered target throttles the flow itself)
+The fast loop is implemented (§4.6). The remaining piece is the slow loop:
+
+- Estimate the production traffic share from CloudWatch `ConsumedWriteCapacityUnits` / `WriteThrottleEvents` and adjust the target ceiling. With 1-minute granularity and 1–3 minutes delivery delay it cannot serve as primary control. Per-GSI hotspots are only visible in CloudWatch (local throttling errors do not tell you which GSI caused them). Without permissions, silently degrade to the fast loop only
 
 ### 5.2 Multi-table / GSI support: vectorizing the resource
 
@@ -104,17 +115,13 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - **Direction**: cap the total number of items existing inside the pipeline with a semaphore. Acquire a permit on admission; release it when the item is finally resolved as successful or permanently failed. This keeps the resident population bounded **even with unbounded channels**, reconciling deadlock freedom (unbounded) with a memory cap (semaphore)
 - The retry path merely circulates while holding its permit, so it does not interfere with admission control
 
-### 5.4 Progress deadline (livelock safety valve)
-
-- As the last line of defense against the infinite-retry livelock of §4.3 and any unforeseen stalls, add a watchdog that aborts with an error when `successful + failed` has not advanced for a certain period. Planned to be implemented together with AIMD
-
-### 5.5 Open design question: partitioned buckets vs a shared bucket
+### 5.4 Open design question: partitioned buckets vs a shared bucket
 
 - With multi-table support, evenly-split per-worker buckets (§4.5) additionally require that the table mix flowing to each worker is uniform — a stronger assumption
 - Options: (a) keep the even split and absorb skew via feedback, (b) a shared bucket per table (accurate but contended), (c) per-table worker pools (gives up multi-table batching)
 - **Settle this with experiments.** Until then, have workers query a "capacity provider" abstraction so the design can fall either way
 
-### 5.6 Phase 3 benchmark plan (not executed yet)
+### 5.5 Phase 3 benchmark plan (not executed yet)
 
 - Subject: single mpsc chunker (current) vs 8 parallel async-channel chunkers (`improve-export-import-async-channel-queue`)
 - Metrics: (1) effective throughput, (2) adherence of consumed WCU to the target (moving-window mean ± stddev = quantifying the "wobble"), (3) wasted requests (requests discarded due to throttling), (4) behavior at low WCU / high WCU / varied item sizes
@@ -126,14 +133,15 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - The old implementation (missing retry re-queueing) reproducibly **hung forever at 561/2000** on a 2-WCU table with 2000 items. About 57 fully-throttled requests × 25 items ≈ 1439 items were silently lost
 - After the fix: five 2000-item runs at 25 WCU and one 300-item run under sustained throttling at 2 WCU — all exit 0 with exact table counts
 - **Beware of burst capacity**: a table accumulates roughly 300 seconds of unused capacity (about 7500 for 25 WCU). A freshly created or idle table will not throttle, so a throttling experiment on one is meaningless. Deplete it first or recreate the table at low WCU
-- Observed the "wrong-direction" scale-out 1→2→4→8 in the middle of a throttling storm (the evidence behind §5.1)
+- Observed the "wrong-direction" scale-out 1→2→4→8 in the middle of a throttling storm (the evidence behind §4.6)
 - The current chunker sends whatever `recv_many` returns, producing many partial chunks of fewer than 25 items (a throughput inefficiency; to be quantified in the benchmark)
+- AIMD verification (10-WCU table, 2000 items, sustained throttling): the effective target halved stepwise from the hardcoded 100,000 down to ~98 while throttling persisted, and the import completed with exit 0. Note that starting from the absurd 100,000 ceiling takes ~13 halvings (~30 s) to reach realistic levels — the `--max-wcu` CLI option (roadmap 4) also matters for giving AIMD a sane starting point
 
 ## 7. Roadmap
 
 1. ~~Build the experiment environment, reproduce the stall, fix item accounting~~ (done)
-2. **Minimal AIMD** (fast loop only) + progress deadline + effective-target-based scale-out decisions ← next
-3. Settle the chunker architecture via benchmark (§5.6)
+2. ~~Minimal AIMD (fast loop only) + progress deadline + effective-target-based scale-out decisions~~ (done; §4.6, §4.7)
+3. Settle the chunker architecture via benchmark (§5.5) ← next
 4. Foundation generalization: resource vectorization (§5.2), move generic parts of `BatchWriteProcess` into algo, reduce `expect`s, scale-in
 5. Finish import: a `--max-wcu`-style CLI option (currently hardcoded to `100_000.0`), streaming file reads + semaphore admission control (§5.3)
 6. CloudWatch slow loop (§5.1, optional)
