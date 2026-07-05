@@ -7,6 +7,11 @@
 This document is deliberately detailed so that the work can be resumed from
 scratch (by a human or an agent) without the original conversation context.
 
+> **Before launching any paid run, read `benchmark-run-postmortem.md`**
+> (same directory): the mandatory gates G0–G3, the preflight script, and
+> the monitoring requirements defined there are non-negotiable — they were
+> paid for with four aborted fleet launches on 2026-07-05.
+
 ## 0. Current Status (checklist)
 
 **Nothing has been executed yet** — neither the simulation scenarios nor any
