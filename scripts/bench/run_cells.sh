@@ -77,9 +77,16 @@ cleanup() {
     done
     # Best-effort: upload whatever partial artifacts exist, plus the boot
     # log — the instance self-terminates, so this is the only post-mortem
-    # trail when a run dies mid-way (there is no SSH/SSM on the fleet).
+    # trail when a run dies mid-way.
     mkdir -p "$WORK_DIR/artifacts"
     cp /var/log/dynein-bench.log "$WORK_DIR/artifacts/boot-shard-$SHARD.log" 2>/dev/null || true
+    # The runner executes as a systemd unit, so its own orchestration log
+    # (retry loops, cell timings, this cleanup) lives in journald, not in
+    # the boot log — salvage it on every exit, not only via the OnFailure
+    # guardian (the 2026-07-05 canary's 15-minute IAM retry loop left no
+    # trace in the uploaded logs because only the failure path saved it).
+    journalctl -u dynein-bench-runner.service --no-pager -n 5000 \
+        > "$WORK_DIR/artifacts/runner-shard-$SHARD.log" 2>/dev/null || true
     if [ -d "$WORK_DIR/artifacts" ]; then
         aws s3 cp --recursive "$WORK_DIR/artifacts" "$S3_PREFIX/" >/dev/null 2>&1
     fi
@@ -251,11 +258,14 @@ run_one() {
     if [ "$reuse" = "0" ] || ! aws dynamodb describe-table --region "$REGION" \
         --table-name "$table" >/dev/null 2>&1; then
         local create_attempts=0
+        # Append (not truncate) so a failing attempt's error text survives
+        # the retry that eventually succeeds — the 2026-07-05 IAM incident
+        # left an empty err file because the last attempt overwrote it.
         until aws dynamodb create-table --region "$REGION" --table-name "$table" \
             --attribute-definitions AttributeName=pk,AttributeType=S \
             --key-schema AttributeName=pk,KeyType=HASH \
             --provisioned-throughput "ReadCapacityUnits=5,WriteCapacityUnits=$wcu" \
-            --tags "Key=dynein-bench,Value=$RUN_ID" >/dev/null 2>"$dir/create-table.err"; do
+            --tags "Key=dynein-bench,Value=$RUN_ID" >/dev/null 2>>"$dir/create-table.err"; do
             create_attempts=$((create_attempts + 1))
             if [ "$create_attempts" -ge 30 ]; then
                 log "SKIP cell=$cell_id rep=$rep: create-table kept failing: $(tail -1 "$dir/create-table.err")"
