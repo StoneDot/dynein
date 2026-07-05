@@ -24,10 +24,10 @@ This document records the design decisions already implemented with their ration
 
 ```
 producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process ch: bounded 16] ──▶ ThrottledExecutor
-(file iter)                               ▲                                          │ round-robin
-                                          │                                          ▼
+(streaming file reader,                   ▲                                          │ round-robin
+ 1 admission permit/item)                 │                                          ▼
                                           └──── [retry ch: unbounded] ◀──── workers (per-worker Bucket)
-                                                                                     │
+                                                     (items keep their permit)       │ (resolve ⇒ return permits)
                                                                                      ▼
                                                                                 BatchWriteItem
 ```
@@ -36,14 +36,15 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - **`src/algo/monitor.rs`** — `Probe` (sends observations) / `Monitor` (statistical throughput judgement using mean + standard deviation)
 - **`src/algo/worker.rs`** — `ThrottledWorker` (waits on the bucket, then processes) and `ThrottledExecutor` (round-robin distribution, automatic scale-out when the target is missed). The workload is abstracted behind the `ResourceConstraintProcess` trait (`estimate_resource` / `process_and_consume_resource`) and is **DynamoDB-agnostic**
 - **`src/ddb/item.rs`** — Item size → WCU estimation based on the heuristics in the official documentation
-- **`src/transfer.rs`** — Pipeline assembly (`stream_writes_with_chucked`). It takes an iterator of `WriteRequest`s, so json/jsonl/csv all go through this path
+- **`src/transfer.rs`** — Pipeline assembly (`stream_writes_with_chucked`). It takes a push-based source of `WriteRequest`s (a closure receiving a sink; §4.11), so json/jsonl/csv all go through this path while streaming from the file
 
 ## 3. Invariants (breaking these is a bug)
 
 1. **Item accounting**: every item submitted to BatchWriteItem is classified into **exactly one** of "successful / queued for retry / permanently failed" per request result (`summarize_batch_write_result`, pinned by unit tests).
    - If this breaks, you get either "silent item loss" (a bug that actually existed; §6) or "a hang waiting forever for items nobody retries"
-2. **Termination condition**: the monitoring task sends the termination signal only when `successful + permanently failed == total submitted`. If permanently failed > 0, the whole import ends with `DyneinBatchError::PermanentWriteFailure` (no hangs, no silent swallowing)
+2. **Termination condition**: the monitoring task sends the termination signal only when the producer has finished admitting items **and** `successful + permanently failed == total admitted`. If permanently failed > 0, the whole import ends with `DyneinBatchError::PermanentWriteFailure` (no hangs, no silent swallowing)
 3. **Deadlock freedom**: enqueueing retries from a worker must **never block** (unbounded channel). See the cycle analysis in §4.2
+4. **Admission permit conservation**: every item admitted into the pipeline holds exactly one semaphore permit from admission until it is resolved (written or permanently failed); retrying items keep theirs. Leaking a permit starves admission into a stall-deadline abort; double-returning one un-bounds resident memory. The exactness of (1) is what makes the permit return exact (§4.11)
 
 ## 4. Implemented Decisions (Decision Record)
 
@@ -58,7 +59,7 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - **Decision**: the dedicated retry channel is unbounded. On every loop iteration the chunker fills the batch with retries via `try_recv` **first**, and only then tops it up with new items
 - **Deadlock analysis** (the cycle that occurs with a bounded channel):
   a worker blocks on sending a retry → the worker never completes, so the executor's `Notify` never fires → the executor stops draining the process channel → the chunker blocks on sending to the process channel → the chunker stops draining retries → the cycle closes. The more throttling, the higher the retry volume and the more likely this is to occur
-- **Memory argument for unboundedness**: the number of items in the retry queue ≤ the number of items admitted into the pipeline and not yet completed. Currently the whole input file is loaded into memory anyway, so this adds no new upper bound. **When file reading is made streaming, this argument weakens — do that change together with the semaphore admission control of §5.2**
+- **Memory argument for unboundedness**: the number of items in the retry queue ≤ the number of items admitted into the pipeline and not yet completed. Originally the whole input file was loaded into memory anyway, so this added no new upper bound; since file reading became streaming (§4.11), the admission semaphore provides the bound instead (admitted-and-unresolved ≤ `ADMISSION_ITEM_CAP`)
 - **Intent of drain-retries-first**: backpressure pointed in the direction of "finish the work you have taken in before accepting new work". It keeps the retry queue practically empty and demotes unboundedness to an insurance policy
 - **Rejected alternatives**: bounded + retry-priority (the cycle remains); synchronous in-worker retries (breaks bucket fairness and round-robin)
 
@@ -159,6 +160,61 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
   wanted later, add it transparently (e.g. a minimum stat-point count in
   `should_grow`), not by biasing the estimator
 
+### 4.11 Streaming file reads + semaphore admission control (2026-07-05)
+
+- **Trigger**: the EC2 benchmark abort — `fs::read_to_string` + whole-file
+  deserialization drove an 8.5GB input to 15.6GB RSS and an OOM kill (§6).
+  This implements roadmap item 6's streaming half together with §5.2's
+  admission control, as §4.2 required
+- **Sources**: `import` no longer materializes anything. Each format has a
+  streaming source pushing items into a sink closure (`transfer.rs`):
+  - json / json-compact: a `DeserializeSeed` visitor walks the top-level
+    array element by element (serde has no pull-based array iteration, so
+    the pipeline entry point is push-based: `stream_writes_with_chucked`
+    takes a source closure, not an iterator). Content after the closing
+    bracket is still an error, as before
+  - jsonl: `Deserializer::from_reader(...).into_iter()` — same parser as
+    before, minus the `collect()`. **Behavior change (deliberate, approved)**:
+    an invalid document now aborts the import with a positioned error. The
+    old `filter_map(Result::ok)` looked like "skip invalid documents" but
+    `StreamDeserializer` actually stops after the first error, so everything
+    after the bad document was silently lost — a silent-loss bug of exactly
+    the kind invariant 1 exists to prevent
+  - csv: line-by-line via `BufRead::lines` + `csv_row_to_request_item`
+    (extracted from the deleted whole-matrix converter). A cell-count
+    mismatch is now a normal error instead of `process::exit(1)`
+- **Producer**: the source runs on a `spawn_blocking` thread (file I/O must
+  not sit on a runtime worker). Its sink acquires **one admission permit per
+  item** (`Semaphore::acquire` + `forget`), counts it into `total_queued`,
+  then `blocking_send`s into the existing bounded main channel. Workers
+  return permits (`add_permits`) for exactly the items each request resolves
+  (successful + permanently failed); retried items keep their permit while
+  they circulate. `ADMISSION_ITEM_CAP = 10_000` bounds the resident
+  population: steady-state saturation needs ≈ 7,300 items (main channel 500
+  + process channel 16×25 + task-executor in-flight ceiling 256×25); it must
+  also stay well above one batch (25) or admission would deadlock against
+  the chunker's full-batch wait. Byte-aware admission (item-size-weighted
+  permits) was considered and deferred: item counts are simple, and 10k of
+  even 400KB-max items caps at ~4GB while typical items stay in the tens of
+  MB — revisit with the resource vectorization of §5.1
+- **Monitoring**: the monitor now starts alongside the producer (production
+  can last the whole import), and terminates on `producer_done && admitted
+  == resolved`. `producer_done` is a Release-store / Acquire-load pair so an
+  observed `true` implies the admitted total is final. The stall deadline
+  (§4.8) is unchanged and also covers a hung producer
+- **Abort path**: the stall abort closes the admission semaphore, which
+  unblocks a producer waiting on `acquire`; the sink then returns `Break`
+  and the source unwinds. A producer-side read/parse error stops admission,
+  lets the already-admitted prefix drain normally, and surfaces after the
+  pipeline settles. Error precedence: stall abort > producer error >
+  permanent write failures
+- **Verification** (DynamoDB Local, release build): 30MB / 33,359 items →
+  max RSS 18.3MB; 300MB / 333,588 items → max RSS 19.9MB (10× input, flat
+  memory), exact item counts, ~4.0–4.4k items/s — same as pre-change local
+  throughput. Unit tests pin each source's streaming, early-stop, and
+  error-position semantics; an integration test pins "invalid jsonl document
+  aborts with the admitted prefix written"
+
 ## 5. Groundwork for Future Design (not implemented, but direction-setting)
 
 ### 5.1 Multi-table / GSI support: vectorizing the resource
@@ -169,10 +225,10 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - **Groundwork in the transfer layer**: `WriteRequest` flowing through the pipeline carries no table name (the chunker injects the single table name). For multi-table, make the channel element `(table name, WriteRequest)` and let the chunker group by table. This can be changed independently of algo
 - **Consumption semantics**: a request spanning multiple keys consumes atomically only when capacity is sufficient for all keys (all-or-nothing). `estimate_available_at` becomes the max across keys
 
-### 5.2 Semaphore-based admission control (a prerequisite for the streaming-read era)
+### 5.2 Semaphore-based admission control — **implemented, see §4.11**
 
 - Once file reading becomes streaming, the argument "unbounded retry is safe because everything is in memory anyway" (§4.2) collapses
-- **Direction**: cap the total number of items existing inside the pipeline with a semaphore. Acquire a permit on admission; release it when the item is finally resolved as successful or permanently failed. This keeps the resident population bounded **even with unbounded channels**, reconciling deadlock freedom (unbounded) with a memory cap (semaphore)
+- **Direction (now realized)**: cap the total number of items existing inside the pipeline with a semaphore. Acquire a permit on admission; release it when the item is finally resolved as successful or permanently failed. This keeps the resident population bounded **even with unbounded channels**, reconciling deadlock freedom (unbounded) with a memory cap (semaphore)
 - The retry path merely circulates while holding its permit, so it does not interfere with admission control
 
 ### 5.3 Open performance questions: executor topology, partitioned vs shared buckets
@@ -276,7 +332,14 @@ rules). Summary:
   **roadmap item 6 (streaming reads + semaphore admission control, §5.2)
   is a prerequisite for the quota-scale mixed/large benchmark cells**, not
   a nice-to-have that can wait until after the benchmark. The quota-scale
-  uniform-small cells (1.3GB) and everything at 10 WCU ran fine
+  uniform-small cells (1.3GB) and everything at 10 WCU ran fine.
+  **Resolved the same day by §4.11**: with streaming reads + admission
+  control, max RSS is flat at ~20MB regardless of input size (30MB and
+  300MB inputs measured within 1.6MB of each other), item counts exact,
+  local throughput unchanged. Along the way the jsonl error handling was
+  fixed: an invalid document used to silently truncate the input at the
+  first error (`filter_map(Result::ok)` over a stream deserializer that
+  stops on error) and now aborts the import with a positioned error
 
 ### 2026-07-04
 
@@ -295,7 +358,7 @@ rules). Summary:
 3. ~~CloudWatch slow control loop (informed recovery)~~ (done; §4.7)
 4. Settle the executor/chunker architecture via benchmark (§5.4, `benchmark-plan.md`) ← next
 5. Foundation generalization: resource vectorization (§5.1), move generic parts of `BatchWriteProcess` into algo, reduce `expect`s, scale-in
-6. Finish import: a `--max-wcu`-style CLI option (currently hardcoded to `100_000.0`), streaming file reads + semaphore admission control (§5.2)
+6. Finish import: ~~streaming file reads + semaphore admission control (§5.2 → §4.11)~~ (done); a `--max-wcu`-style CLI option (currently hardcoded to `100_000.0`) remains
 7. Parallel scan for export (RCU variant, separate branch)
 8. Squash, sign, and tidy up the wip commits
 

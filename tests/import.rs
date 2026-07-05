@@ -209,6 +209,52 @@ async fn test_import_jsonl() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn test_import_jsonl_aborts_on_invalid_document() -> Result<(), Box<dyn std::error::Error>> {
+    let mut tm = util::setup().await?;
+    let tbl = tm.create_temporary_table("pk", Some("sk,N")).await?;
+    let base_dir = tempdir()?;
+    let temp_path = base_dir.path().join(&tbl);
+
+    // The second document is invalid. The import must fail instead of
+    // silently losing every document after the invalid one, and documents
+    // admitted before the error must still be drained into the table.
+    let jsonl_contents = r#"{"pk":"pk1","sk":1}
+not json
+{"pk":"pk2","sk":2}"#;
+    fs::write(&temp_path, jsonl_contents)?;
+
+    tm.command()?
+        .args([
+            "-r",
+            "local",
+            "import",
+            "-t",
+            &tbl,
+            "-f",
+            "jsonl",
+            "-i",
+            &temp_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+
+    // The document before the invalid one was admitted and drained.
+    assert_eq_cmd_json(
+        tm.command()?
+            .args(["-r", "local", "get", "-t", &tbl, "pk1", "1"]),
+        r#"{"pk":"pk1","sk":1}"#,
+    );
+    // The document after the invalid one must not have been written.
+    tm.command()?
+        .args(["-r", "local", "get", "-t", &tbl, "pk2", "2"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No item found."));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_import_jsonl_with_set_inference() -> Result<(), Box<dyn std::error::Error>> {
     let mut tm = util::setup().await?;
     let tbl = tm.create_temporary_table("pk", None).await?;

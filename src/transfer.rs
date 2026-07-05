@@ -31,9 +31,10 @@ use aws_smithy_runtime_api::client::result::SdkError;
 use console::Term;
 use dialoguer::Confirm;
 use log::{debug, error, info, trace, warn};
-use serde_json::{de::StrRead, Deserializer, StreamDeserializer, Value as JsonValue};
+use serde_json::{Deserializer, Value as JsonValue};
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -316,14 +317,16 @@ pub async fn import(
         }
     }
 
-    info!("Start loading a file");
-    let input_string: String = if Path::new(&input_file).exists() {
-        fs::read_to_string(&input_file)?
+    // Items are streamed out of the file while the pipeline writes them, so
+    // memory usage is bounded by the admission cap, not by the input size.
+    // Opening the file up front keeps "file not found" a pre-pipeline error.
+    let file: fs::File = if Path::new(&input_file).exists() {
+        fs::File::open(&input_file)?
     } else {
         error!("Couldn't find the input file '{}'.", &input_file);
         std::process::exit(1);
     };
-    info!("Loaded a file");
+    info!("Start streaming items from the input file");
 
     // Give the AIMD congestion control a realistic starting point and a
     // capacity reference derived from known table information instead of the
@@ -332,58 +335,44 @@ pub async fn import(
 
     match format_str {
         None | Some("json") | Some("json-compact") => {
-            info!("Start JSON conversion");
-            let array_of_json_obj: Vec<JsonValue> = serde_json::from_str(&input_string)?;
-            info!("End JSON conversion");
             // TODO: to change configurable
-            stream_write_of_jsons_with_chunked(
+            stream_writes_with_chucked(
                 cx,
-                array_of_json_obj.into_iter(),
-                enable_set_inference,
+                move |sink| {
+                    stream_json_array_items(std::io::BufReader::new(file), &mut |v| {
+                        let item = batch::convert_jsonval_to_hashmap(&v, enable_set_inference);
+                        sink(batch::construct_put_write_request(item))
+                    })
+                },
                 100_000.0,
                 hints,
             )
             .await?;
         }
         Some("jsonl") => {
-            // JSON Lines can be deserialized with into_iter() as below.
-            let array_of_json_obj: StreamDeserializer<'_, StrRead<'_>, JsonValue> =
-                Deserializer::from_str(&input_string).into_iter::<JsonValue>();
-            // list_of_jsons contains deserialize results. Filter them and get only valid items.
-            let array_of_valid_json_obj: Vec<JsonValue> =
-                array_of_json_obj.filter_map(Result::ok).collect();
-            stream_write_of_jsons_with_chunked(
+            stream_writes_with_chucked(
                 cx,
-                array_of_valid_json_obj.into_iter(),
-                enable_set_inference,
+                move |sink| {
+                    stream_jsonl_items(std::io::BufReader::new(file), &mut |v| {
+                        let item = batch::convert_jsonval_to_hashmap(&v, enable_set_inference);
+                        sink(batch::construct_put_write_request(item))
+                    })
+                },
                 100_000.0,
                 hints,
             )
             .await?;
         }
         Some("csv") => {
-            let lines: Vec<&str> = input_string
-                .split('\n')
-                .collect::<Vec<&str>>() // split by "\n" and get lines
-                .into_iter()
-                .filter(|&x| !x.is_empty())
-                .collect::<Vec<&str>>(); // remove blank line (e.g. last line)
-            let headers: Vec<&str> = lines[0].split(',').collect::<Vec<&str>>();
-            let mut matrix: Vec<Vec<&str>> = vec![];
-            // Iterate over lines (from index = 1, as index = 0 is the header line)
-            for line in lines.iter().skip(1) {
-                let cells: Vec<&str> = line.split(',').collect::<Vec<&str>>();
-                debug!("splitted line => {:?}", cells);
-                matrix.push(cells);
-            }
-
-            let request_items: Vec<WriteRequest> = batch::csv_matrix_to_request_items(
-                matrix.as_slice(),
-                headers.as_slice(),
-                enable_set_inference,
+            stream_writes_with_chucked(
+                cx,
+                move |sink| {
+                    stream_csv_rows(std::io::BufReader::new(file), enable_set_inference, sink)
+                },
+                100_000.0,
+                hints,
             )
             .await?;
-            stream_writes_with_chucked(cx, request_items.into_iter(), 100_000.0, hints).await?;
         }
         Some(o) => panic!("Invalid input format is given: {}", o),
     }
@@ -568,6 +557,22 @@ fn build_csv_header(
 }
 
 const BATCH_WRITE_BUFFER_SIZE: usize = 500;
+
+/// Upper bound on the number of items resident in the import pipeline at
+/// once (main channel + chunker batch + process channel + in-flight requests
+/// + retry queue). With streaming file reads the input size no longer bounds
+/// memory, and the unbounded retry channel needs a new bound: the producer
+/// acquires one admission permit per item and the permit is released only
+/// when the item is finally resolved (written or permanently failed), so
+/// retries circulate without interfering with admission.
+///
+/// Sizing: the steady-state population needed to saturate the highest
+/// targets is roughly main channel (500) + process channel (16×25) + the
+/// task executor's default in-flight ceiling (256 requests × 25 items) ≈
+/// 7,300 items; 10,000 leaves headroom. It must also comfortably exceed one
+/// batch (25) — the chunker waits for a full batch, so a cap smaller than a
+/// batch would deadlock admission against batching.
+const ADMISSION_ITEM_CAP: usize = 10_000;
 
 /// Ratio applied to the provisioned WCU to decide the initial effective target.
 /// Not starting at 100% leaves room for co-located production workloads from
@@ -988,18 +993,130 @@ fn summarize_batch_write_result(
     }
 }
 
-async fn stream_write_of_jsons_with_chunked(
-    cx: &app::Context,
-    iter: impl Iterator<Item = JsonValue>,
-    enable_set_inference: bool,
-    max_wcu: f64,
-    hints: CapacityHints,
+/// Streams the elements of a top-level JSON array from `reader` into `sink`
+/// without materializing the whole array (the whole-file `Vec<JsonValue>`
+/// deserialization was the OOM cause on multi-GB inputs). `sink` returns
+/// `Break` to stop early — e.g. the pipeline is shutting down — and an early
+/// stop is not an error. Content after the closing bracket is an error, for
+/// parity with the previous `from_str::<Vec<JsonValue>>` behavior.
+fn stream_json_array_items<R: std::io::Read>(
+    reader: R,
+    sink: &mut dyn FnMut(JsonValue) -> ControlFlow<()>,
 ) -> Result<(), batch::DyneinBatchError> {
-    let iter = iter.map(|item| {
-        let item = batch::convert_jsonval_to_hashmap(&item, enable_set_inference);
-        batch::construct_put_write_request(item)
-    });
-    stream_writes_with_chucked(cx, iter.into_iter(), max_wcu, hints).await
+    struct ArraySeed<'a> {
+        sink: &'a mut dyn FnMut(JsonValue) -> ControlFlow<()>,
+        stopped: &'a mut bool,
+    }
+
+    impl<'de> serde::de::Visitor<'de> for ArraySeed<'_> {
+        type Value = ();
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a top-level JSON array of items")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            while let Some(v) = seq.next_element::<JsonValue>()? {
+                if (self.sink)(v).is_break() {
+                    *self.stopped = true;
+                    return Err(serde::de::Error::custom(
+                        "the pipeline stopped accepting items",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl<'de> serde::de::DeserializeSeed<'de> for ArraySeed<'_> {
+        type Value = ();
+
+        fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_seq(self)
+        }
+    }
+
+    let mut stopped = false;
+    let mut deserializer = Deserializer::from_reader(reader);
+    let result = serde::de::DeserializeSeed::deserialize(
+        ArraySeed {
+            sink,
+            stopped: &mut stopped,
+        },
+        &mut deserializer,
+    );
+    match result {
+        Ok(()) => {
+            deserializer.end()?;
+            Ok(())
+        }
+        // The early stop travels through serde as an error; it is not one.
+        Err(_) if stopped => Ok(()),
+        Err(e) => Err(batch::DyneinBatchError::PraseJSON(e)),
+    }
+}
+
+/// Streams whitespace-separated JSON documents from `reader` — JSON Lines
+/// and the looser concatenated form the previous StreamDeserializer-based
+/// implementation accepted. An invalid document aborts with an error
+/// carrying its position: the old `filter_map(Result::ok)` looked like a
+/// skip but actually stopped reading at the first error, silently losing
+/// every document after it.
+fn stream_jsonl_items<R: std::io::Read>(
+    reader: R,
+    sink: &mut dyn FnMut(JsonValue) -> ControlFlow<()>,
+) -> Result<(), batch::DyneinBatchError> {
+    for result in Deserializer::from_reader(reader).into_iter::<JsonValue>() {
+        if sink(result?).is_break() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Streams CSV rows as put requests. The first non-empty line is the header;
+/// empty lines are skipped (parity with the previous whole-file
+/// implementation, which filtered them out anywhere in the file).
+fn stream_csv_rows<R: std::io::BufRead>(
+    reader: R,
+    enable_set_inference: bool,
+    sink: &mut dyn FnMut(WriteRequest) -> ControlFlow<()>,
+) -> Result<(), batch::DyneinBatchError> {
+    let mut lines = reader.lines();
+    let header_line = loop {
+        match lines.next() {
+            Some(line) => {
+                let line = line?;
+                if !line.is_empty() {
+                    break line;
+                }
+            }
+            None => {
+                return Err(batch::DyneinBatchError::InvalidInput(
+                    "The CSV input has no header line".to_string(),
+                ))
+            }
+        }
+    };
+    let headers: Vec<&str> = header_line.split(',').collect();
+
+    for line in lines {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let request = batch::csv_row_to_request_item(&headers, &line, enable_set_inference)?;
+        if sink(request).is_break() {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Fills `items` up to `capacity` from the producer channel, waiting for
@@ -1026,9 +1143,18 @@ async fn fill_to_capacity(
     true
 }
 
+/// Streams write requests produced by `source` into the throttled write
+/// pipeline. `source` runs on a blocking thread (file I/O) and pushes items
+/// through the sink it is given; the sink blocks on admission control and
+/// returns `Break` when the pipeline stops accepting items (abort), which
+/// the source must propagate by returning promptly.
 async fn stream_writes_with_chucked(
     cx: &app::Context,
-    iter: impl Iterator<Item = WriteRequest>,
+    source: impl FnOnce(
+            &mut dyn FnMut(WriteRequest) -> ControlFlow<()>,
+        ) -> Result<(), batch::DyneinBatchError>
+        + Send
+        + 'static,
     max_wcu: f64,
     hints: CapacityHints,
 ) -> Result<(), batch::DyneinBatchError> {
@@ -1037,6 +1163,15 @@ async fn stream_writes_with_chucked(
     )));
     let complete_items_count = Arc::new(AtomicUsize::new(0));
     let failed_items_count = Arc::new(AtomicUsize::new(0));
+
+    // Admission control (see ADMISSION_ITEM_CAP): one permit per item inside
+    // the pipeline. Permits are forgotten on acquisition and re-added when
+    // items resolve, so the semaphore counts the resident population.
+    let admission = Arc::new(tokio::sync::Semaphore::new(ADMISSION_ITEM_CAP));
+    // Items admitted so far. Grows while the producer runs; final once
+    // `producer_done` is set (store-Release / load-Acquire pairing).
+    let total_queued_count = Arc::new(AtomicUsize::new(0));
+    let producer_done = Arc::new(AtomicBool::new(false));
 
     // This channel is used to terminate chunking process.
     // Turning value into true indicates terminating signal.
@@ -1064,6 +1199,7 @@ async fn stream_writes_with_chucked(
         progress_status: Arc<std::sync::Mutex<ProgressState>>,
         complete_items_count: Arc<AtomicUsize>,
         failed_items_count: Arc<AtomicUsize>,
+        admission: Arc<tokio::sync::Semaphore>,
     }
 
     impl algo::worker::ResourceConstraintProcess for BatchWriteProcess {
@@ -1131,6 +1267,15 @@ async fn stream_writes_with_chucked(
                     .fetch_add(summary.failed_items, Ordering::Relaxed);
             }
 
+            // Return the admission permits of resolved items. Items queued
+            // for retry keep theirs — they are still inside the pipeline.
+            // The item accounting invariant (each item resolves exactly once)
+            // guarantees permits are returned exactly once per item.
+            let resolved = summary.successful_items + summary.failed_items;
+            if resolved > 0 {
+                self.admission.add_permits(resolved);
+            }
+
             algo::worker::ProcessResult {
                 consumed: summary.consumed_capacity,
                 throttled: summary.throttled,
@@ -1190,6 +1335,7 @@ async fn stream_writes_with_chucked(
     let status = progress_status.clone();
     let count = complete_items_count.clone();
     let failed = failed_items_count.clone();
+    let admission_for_chunker = admission.clone();
     let chunking_handle = tokio::spawn(async move {
         let mut items = Vec::with_capacity(25);
         // Becomes false once all input items have been queued and the producer closed
@@ -1255,6 +1401,7 @@ async fn stream_writes_with_chucked(
                 progress_status: status.clone(),
                 complete_items_count: count.clone(),
                 failed_items_count: failed.clone(),
+                admission: admission_for_chunker.clone(),
             })
             .await
             .expect("Failed to pass items to write");
@@ -1277,25 +1424,55 @@ async fn stream_writes_with_chucked(
     // Start executor
     let executor_handle = tokio::spawn(async move { executor.run().await });
 
-    // Consume all data provided by
-    let mut total_items_count: usize = 0;
-    for write_request in iter {
-        trace!("Send write_request to queue: {:?}", write_request);
-        tx.send(write_request)
-            .await
-            .expect("Unexpected channel close.");
-        total_items_count += 1;
-    }
-    info!("Queued all items");
-    drop(tx);
+    // Run the producer on a blocking thread: it streams items out of the
+    // input file and admits them into the pipeline one permit at a time.
+    // It finishes long before the import does only when the input is small;
+    // in general it runs for most of the import, paced by admission control.
+    let producer_admission = admission.clone();
+    let producer_total = total_queued_count.clone();
+    let producer_done_flag = producer_done.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let producer_handle = tokio::task::spawn_blocking(move || {
+        let result = source(&mut |write_request: WriteRequest| {
+            trace!("Send write_request to queue: {:?}", write_request);
+            // Wait for an admission permit. The permit is carried by the
+            // item through the pipeline (including the retry loop) and is
+            // re-added by the worker when the item resolves. A closed
+            // semaphore means the pipeline aborted: stop producing.
+            match runtime.block_on(producer_admission.acquire()) {
+                Ok(permit) => permit.forget(),
+                Err(_) => return ControlFlow::Break(()),
+            }
+            // Count before sending: the monitor acts on this total only
+            // after `producer_done`, and an overcount can happen only on
+            // the abort path below, where termination no longer relies on
+            // the count.
+            producer_total.fetch_add(1, Ordering::Relaxed);
+            // A send error means the chunker is gone (abort in progress).
+            match tx.blocking_send(write_request) {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(_) => ControlFlow::Break(()),
+            }
+        });
+        info!("Queued all items");
+        // Release ordering pairs with the monitor's Acquire load: once the
+        // monitor observes producer_done == true, the total is final.
+        producer_done_flag.store(true, Ordering::Release);
+        // Returning drops `tx`, letting the chunker see the end of input.
+        result
+    });
 
     // Start monitoring the end of the chunking process.
-    // The process terminates when every item is accounted for: either successfully
-    // written or permanently failed. Items queued for retry belong to neither yet.
+    // The process terminates when the producer has admitted everything and
+    // every admitted item is accounted for: either successfully written or
+    // permanently failed. Items queued for retry belong to neither yet.
     // As a safety valve against livelocks, it also aborts the pipeline when no
     // progress has been made for STALL_DEADLINE.
     let complete_count_for_monitor = complete_items_count.clone();
     let failed_count_for_monitor = failed_items_count.clone();
+    let total_count_for_monitor = total_queued_count.clone();
+    let producer_done_for_monitor = producer_done.clone();
+    let admission_for_monitor = admission.clone();
     let stalled = Arc::new(AtomicBool::new(false));
     let stalled_for_monitor = stalled.clone();
     let monitoring_handle = tokio::spawn(async move {
@@ -1303,12 +1480,17 @@ async fn stream_writes_with_chucked(
         loop {
             let complete_items_count = complete_count_for_monitor.load(Ordering::Relaxed);
             let failed_items_count = failed_count_for_monitor.load(Ordering::Relaxed);
+            let producer_done = producer_done_for_monitor.load(Ordering::Acquire);
+            let total_items_count = total_count_for_monitor.load(Ordering::Relaxed);
             debug!(
-                "complete_items: {}/{} (failed_items: {})",
-                complete_items_count, total_items_count, failed_items_count
+                "complete_items: {}/{}{} (failed_items: {})",
+                complete_items_count,
+                total_items_count,
+                if producer_done { "" } else { "+" },
+                failed_items_count
             );
             let resolved_items = complete_items_count + failed_items_count;
-            if total_items_count == resolved_items {
+            if producer_done && total_items_count == resolved_items {
                 terminate_tx
                     .send(true)
                     .expect("Failed to terminate the chunking process");
@@ -1320,6 +1502,9 @@ async fn stream_writes_with_chucked(
                     STALL_DEADLINE
                 );
                 stalled_for_monitor.store(true, Ordering::Relaxed);
+                // Unblock a producer waiting on admission; its next sink
+                // call then returns Break and the producer winds down.
+                admission_for_monitor.close();
                 terminate_tx
                     .send(true)
                     .expect("Failed to terminate the chunking process");
@@ -1340,6 +1525,11 @@ async fn stream_writes_with_chucked(
     monitoring_handle
         .await
         .expect("Failed to wait the monitoring process");
+    // A producer error (unreadable or invalid input) surfaces after the
+    // already-admitted items have drained through the pipeline above.
+    let producer_result = producer_handle
+        .await
+        .expect("Failed to wait the producer process");
     if let Some(handle) = slow_loop_handle {
         // The slow control loop exits on the termination signal sent above.
         handle.await.expect("Failed to wait the slow control loop");
@@ -1370,9 +1560,13 @@ async fn stream_writes_with_chucked(
             + failed_items_count.load(Ordering::Relaxed);
         return Err(batch::DyneinBatchError::ProgressStalled(
             resolved_items,
-            total_items_count,
+            total_queued_count.load(Ordering::Relaxed),
         ));
     }
+
+    // Next, a producer-side read/parse error: the admitted prefix of the
+    // input has drained, but the rest was never read.
+    producer_result?;
 
     // Report items failed with non-retryable errors as an error of the whole import.
     let failed_items = failed_items_count.load(Ordering::Relaxed);
@@ -1634,6 +1828,212 @@ mod tests {
         assert!(v["tokio"]["total_poll_duration_us"].is_u64());
         assert!(v["tokio"]["total_scheduled_duration_us"].is_u64());
         assert!(v["tokio"]["total_slow_poll_count"].is_u64());
+    }
+
+    fn collect_json_values(
+        result_sink: &mut Vec<JsonValue>,
+    ) -> impl FnMut(JsonValue) -> std::ops::ControlFlow<()> + '_ {
+        move |v| {
+            result_sink.push(v);
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+
+    #[test]
+    fn test_stream_json_array_items_streams_elements() {
+        let input = r#"[{"a": 1}, {"b": 2}]"#;
+        let mut seen = vec![];
+        let result = stream_json_array_items(input.as_bytes(), &mut collect_json_values(&mut seen));
+        assert!(result.is_ok());
+        assert_eq!(
+            seen,
+            vec![serde_json::json!({"a": 1}), serde_json::json!({"b": 2})]
+        );
+    }
+
+    #[test]
+    fn test_stream_json_array_items_accepts_empty_array() {
+        let mut seen = vec![];
+        let result = stream_json_array_items("[]".as_bytes(), &mut collect_json_values(&mut seen));
+        assert!(result.is_ok());
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn test_stream_json_array_items_rejects_non_array() {
+        let mut seen = vec![];
+        let result = stream_json_array_items(
+            r#"{"a": 1}"#.as_bytes(),
+            &mut collect_json_values(&mut seen),
+        );
+        assert!(result.is_err());
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn test_stream_json_array_items_propagates_element_error() {
+        // The first element must already have been delivered when the error
+        // on the second element surfaces: parsing is incremental.
+        let input = r#"[{"a": 1}, oops]"#;
+        let mut seen = vec![];
+        let result = stream_json_array_items(input.as_bytes(), &mut collect_json_values(&mut seen));
+        assert!(result.is_err());
+        assert_eq!(seen, vec![serde_json::json!({"a": 1})]);
+    }
+
+    #[test]
+    fn test_stream_json_array_items_rejects_trailing_garbage() {
+        let input = r#"[{"a": 1}] x"#;
+        let mut seen = vec![];
+        let result = stream_json_array_items(input.as_bytes(), &mut collect_json_values(&mut seen));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stream_json_array_items_early_stop_is_not_an_error() {
+        let input = r#"[{"a": 1}, {"b": 2}, {"c": 3}]"#;
+        let mut seen = vec![];
+        let result = stream_json_array_items(input.as_bytes(), &mut |v| {
+            seen.push(v);
+            std::ops::ControlFlow::Break(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(seen, vec![serde_json::json!({"a": 1})]);
+    }
+
+    #[test]
+    fn test_stream_jsonl_items_streams_documents() {
+        let input = "{\"a\": 1}\n{\"b\": 2}\n";
+        let mut seen = vec![];
+        let result = stream_jsonl_items(input.as_bytes(), &mut collect_json_values(&mut seen));
+        assert!(result.is_ok());
+        assert_eq!(
+            seen,
+            vec![serde_json::json!({"a": 1}), serde_json::json!({"b": 2})]
+        );
+    }
+
+    #[test]
+    fn test_stream_jsonl_items_accepts_documents_spanning_lines() {
+        // Parity with the previous StreamDeserializer-based implementation:
+        // whitespace-separated documents are accepted even across lines.
+        let input = "{\n  \"a\": 1\n}\n{\"b\": 2}";
+        let mut seen = vec![];
+        let result = stream_jsonl_items(input.as_bytes(), &mut collect_json_values(&mut seen));
+        assert!(result.is_ok());
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn test_stream_jsonl_items_accepts_empty_input() {
+        let mut seen = vec![];
+        let result = stream_jsonl_items("".as_bytes(), &mut collect_json_values(&mut seen));
+        assert!(result.is_ok());
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn test_stream_jsonl_items_fails_on_invalid_document() {
+        // An invalid document aborts the import instead of silently losing
+        // the rest of the file (the old filter_map(Result::ok) behavior).
+        let input = "{\"a\": 1}\nnot json\n{\"b\": 2}\n";
+        let mut seen = vec![];
+        let result = stream_jsonl_items(input.as_bytes(), &mut collect_json_values(&mut seen));
+        assert!(result.is_err());
+        assert_eq!(seen, vec![serde_json::json!({"a": 1})]);
+    }
+
+    #[test]
+    fn test_stream_jsonl_items_early_stop_is_not_an_error() {
+        let input = "{\"a\": 1}\n{\"b\": 2}\n";
+        let mut seen = vec![];
+        let result = stream_jsonl_items(input.as_bytes(), &mut |v| {
+            seen.push(v);
+            std::ops::ControlFlow::Break(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(seen.len(), 1);
+    }
+
+    fn put_item_attr(req: &WriteRequest, attr: &str) -> AttributeValue {
+        req.put_request()
+            .expect("should be a put request")
+            .item()
+            .get(attr)
+            .expect("attribute should exist")
+            .clone()
+    }
+
+    #[test]
+    fn test_stream_csv_rows_streams_rows() {
+        let input = "pk,sk\n\"pk1\",1\n\"pk2\",2\n";
+        let mut seen: Vec<WriteRequest> = vec![];
+        let result = stream_csv_rows(input.as_bytes(), false, &mut |req| {
+            seen.push(req);
+            std::ops::ControlFlow::Continue(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            put_item_attr(&seen[0], "pk"),
+            AttributeValue::S("pk1".to_string())
+        );
+        assert_eq!(
+            put_item_attr(&seen[0], "sk"),
+            AttributeValue::N("1".to_string())
+        );
+        assert_eq!(
+            put_item_attr(&seen[1], "pk"),
+            AttributeValue::S("pk2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stream_csv_rows_skips_empty_lines() {
+        let input = "pk,sk\n\"pk1\",1\n\n\"pk2\",2\n\n";
+        let mut seen: Vec<WriteRequest> = vec![];
+        let result = stream_csv_rows(input.as_bytes(), false, &mut |req| {
+            seen.push(req);
+            std::ops::ControlFlow::Continue(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn test_stream_csv_rows_fails_on_cell_count_mismatch() {
+        // The old implementation called process::exit(1); now the mismatch is
+        // reported as a normal error so admitted items can drain first.
+        let input = "pk,sk\n\"pk1\",1,42\n";
+        let mut seen: Vec<WriteRequest> = vec![];
+        let result = stream_csv_rows(input.as_bytes(), false, &mut |req| {
+            seen.push(req);
+            std::ops::ControlFlow::Continue(())
+        });
+        assert!(result.is_err());
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn test_stream_csv_rows_fails_on_empty_input() {
+        let mut seen: Vec<WriteRequest> = vec![];
+        let result = stream_csv_rows("".as_bytes(), false, &mut |req| {
+            seen.push(req);
+            std::ops::ControlFlow::Continue(())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stream_csv_rows_early_stop_is_not_an_error() {
+        let input = "pk,sk\n\"pk1\",1\n\"pk2\",2\n";
+        let mut seen: Vec<WriteRequest> = vec![];
+        let result = stream_csv_rows(input.as_bytes(), false, &mut |req| {
+            seen.push(req);
+            std::ops::ControlFlow::Break(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(seen.len(), 1);
     }
 
     #[test]

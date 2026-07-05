@@ -390,55 +390,41 @@ pub fn construct_put_write_request(item: HashMap<String, AttributeValue>) -> Wri
         .build()
 }
 
-/// "matrix" is a vector of vectors. These internal vectors has strs, each of them is an attribute for an item.
-///
-/// e.g.
-///    name, age, fruit ... headers
-/// [[John, 12, Apple],
-///  [Ami, 23, Orange],
-///  [Shu, 42, Banana]] ... matrix
-pub async fn csv_matrix_to_request_items(
-    matrix: &[Vec<&str>],
+/// Converts a single CSV line into a put request using `headers`. Note that
+/// DynamoDB data types of attributes are left to how serde_json parses each
+/// cell. A cell count mismatch against the header is reported as an error so
+/// that a streaming caller can drain already-admitted items before failing.
+pub fn csv_row_to_request_item(
     headers: &[&str],
+    line: &str,
     enable_set_inference: bool,
-) -> Result<Vec<WriteRequest>, DyneinBatchError> {
-    let total_elements_in_matrix: usize = matrix
-        .iter()
-        .map(|x| x.len())
-        .collect::<Vec<usize>>()
-        .iter()
-        .sum::<usize>();
-    if (headers.len() * matrix.len()) != total_elements_in_matrix {
-        error!("cells in the 'matrix' should have exact the same number of elements of 'headers'");
-        std::process::exit(1);
+) -> Result<WriteRequest, DyneinBatchError> {
+    let cells: Vec<&str> = line.split(',').collect();
+    if cells.len() != headers.len() {
+        return Err(DyneinBatchError::InvalidInput(format!(
+            "A CSV row has {} cell(s) while the header defines {} column(s): '{}'",
+            cells.len(),
+            headers.len(),
+            line
+        )));
     }
 
-    let mut write_requests = Vec::<WriteRequest>::new();
-
-    for cells in matrix {
-        // Build an item. Note that DynamoDB data type of attributes are left to how serde_json::from_str parse the value in the cell.
-        let mut item = HashMap::<String, AttributeValue>::new();
-        for i in 0..headers.len() {
-            let jsonval = serde_json::from_str(cells[i])?;
-            debug!(
-                "CSV cell '{:?}' --serde_json::from_str--> JsonValue: {:?}",
-                cells[i], jsonval
-            );
-            item.insert(
-                headers[i].to_string(),
-                data::dispatch_jsonvalue_to_attrval(&jsonval, enable_set_inference),
-            );
-        }
-
-        // Fill meaningful put_request here, then push it to the write_requests. Then go to the next item.
-        write_requests.push(
-            WriteRequest::builder()
-                .put_request(PutRequest::builder().set_item(Some(item)).build().unwrap())
-                .build(),
+    let mut item = HashMap::<String, AttributeValue>::new();
+    for (header, cell) in headers.iter().zip(cells) {
+        let jsonval = serde_json::from_str(cell)?;
+        debug!(
+            "CSV cell '{:?}' --serde_json::from_str--> JsonValue: {:?}",
+            cell, jsonval
+        );
+        item.insert(
+            header.to_string(),
+            data::dispatch_jsonvalue_to_attrval(&jsonval, enable_set_inference),
         );
     }
 
-    Ok(write_requests)
+    Ok(WriteRequest::builder()
+        .put_request(PutRequest::builder().set_item(Some(item)).build().unwrap())
+        .build())
 }
 
 /* =================================================
