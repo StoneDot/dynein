@@ -213,6 +213,7 @@ for pair in $INSTANCE_TYPES; do
             --image-id "$ami" \
             --instance-type "$itype" \
             --count 1 \
+            --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=100,VolumeType=gp3,DeleteOnTermination=true}' \
             --iam-instance-profile "Name=$IAM_PROFILE" \
             --instance-initiated-shutdown-behavior terminate \
             --user-data "file://$userdata" \

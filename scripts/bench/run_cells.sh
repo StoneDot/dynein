@@ -126,12 +126,13 @@ ordered = sorted(
 for cell in ordered:
     avg = AVG_WCU[cell["mix"]]
     budget = cell.get("budget_secs") or int(math.ceil(cell["items"] * avg / cell["wcu"]) + 300)
-    # Deterministic per-cell seed; identical across reps so repetitions
-    # measure run-to-run variance on the same input (and the generated
-    # file is reused across reps -- matters for quota-scale multi-GB inputs).
+    # Deterministic seed per (mix, items) — NOT per cell: every executor
+    # then processes byte-identical input (stronger comparability), and the
+    # generated file is shared across cells and reps (quota-scale inputs
+    # are multi-GB; per-cell seeds needed ~4x the disk).
     seed = cell.get("seed")
     if seed is None:
-        seed = zlib.crc32(cell["cell_id"].encode()) & 0x7FFFFFFF
+        seed = zlib.crc32(f"{cell['mix']}-{cell['items']}".encode()) & 0x7FFFFFFF
     for rep in range(1, int(cell["reps"]) + 1):
         print("\t".join(str(x) for x in [
             cell["cell_id"], cell["executor"], cell["mix"], cell["wcu"],
