@@ -89,7 +89,9 @@ cat > "$MATRIX_JSON" <<EOF
   "mixes": ["uniform-small", "mixed", "uniform-large"],
   "reps": 3,
   "prod_rate": 0,
-  "quota_wcu": $QUOTA_WCU
+  "quota_wcu": $QUOTA_WCU,
+  "quota_reps": 2,
+  "quota_steady_secs": 300
 }
 EOF
 
@@ -110,7 +112,13 @@ for executor in matrix["executors"]:
         wcu_val = matrix["quota_wcu"] if wcu == "quota" else wcu
         for mix in matrix["mixes"]:
             avg = AVG_WCU[mix]
-            items = int(math.ceil(wcu_val * 400 / avg))
+            # Quota-scale cells dominate the DynamoDB cost (~$0.5/min of
+            # table lifetime), so they run the plan's minimum steady state
+            # (300s) and fewer reps; the cheap low-rate cells keep the full
+            # settings.
+            steady_secs = matrix.get("quota_steady_secs", 400) if wcu == "quota" else 400
+            reps = matrix.get("quota_reps", matrix["reps"]) if wcu == "quota" else matrix["reps"]
+            items = int(math.ceil(wcu_val * steady_secs / avg))
             work_secs = math.ceil(items * avg / wcu_val)
             cells.append({
                 "cell_id": f"{executor}-{wcu_label}-{MIX_SHORT[mix]}",
@@ -119,7 +127,7 @@ for executor in matrix["executors"]:
                 "wcu": wcu_val,
                 "items": items,
                 "prod_rate": matrix["prod_rate"],
-                "reps": matrix["reps"],
+                "reps": reps,
                 "budget_secs": work_secs + 300,
             })
 # Round-robin shard assignment; both instance types run all shards (Q6).
