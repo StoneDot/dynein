@@ -206,6 +206,13 @@ rules). Summary:
   production-first held on the new executors; the simulation predicts C
   removes the scale-out ramp-up penalty entirely in the high-rate regime
   (CPU cost remains unmeasured until EC2)
+- **DynamoDB Local high-rate check** (`benchmark-plan.md` §2.7): at a
+  reachable 4k WCU/s target all four candidates are indistinguishable and
+  hit the target exactly; at an unreachable 32k target (server saturated)
+  C loses 42% throughput with 2.4× CPU — no queue backpressure means
+  partial batches (21.4 items/request) and up to 1024 requests in flight
+  against a saturated server — while B matches the pools with half the
+  workers and ~30% less CPU. Recorded as sub-hypotheses for the EC2 runs
 
 ### 2026-07-04
 

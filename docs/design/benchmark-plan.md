@@ -194,6 +194,60 @@ Interpretation (what phase 1 can and cannot say):
   refunds at `max_cap` (required for C's shared bucket; a serial per-worker
   bucket could not overflow).
 
+## 2.7 DynamoDB Local High-Rate Observations (2026-07-05)
+
+DynamoDB Local cannot reproduce throttling, but the **high-request-rate
+regime needs no throttling** — so it provides a cheap intermediate check
+between the simulation (no CPU) and EC2 (real everything): real HTTP/SDK/CPU
+against a local server. Setup: `amazon/dynamodb-local` (docker, `-inMemory`),
+uniform-small items, `dy -r local`, release build, 8-core dev machine.
+Caveats up front: loopback latency is sub-ms (needed concurrency ≈ rate ×
+latency stays ≪ 1, so the ramp-up effect of §2.6 is structurally invisible
+here), the Java server competes for the same CPUs, and it is a single node
+— "server saturation" behaves differently from real DynamoDB partitions.
+
+**Cell 1 — target 4,000/s (on-demand table), 120k items**: all four
+candidates identical and perfect: wall 30.1s = ideal, 3,990 items/s, full
+25-item batches (~4,805 requests), t(25/50/90%) exactly on schedule, user
+CPU 1.6–2.0s. At a *reachable* target the architectures are
+indistinguishable end-to-end on the real binary, and per-request overhead
+differences are negligible (weak positive signal for C on Q4).
+
+**Cell 2 — target 32,000/s (provisioned 40k table), 400k items — the server
+saturates at ~8.4k items/s, i.e. an unreachable target**:
+
+| candidate | wall | items/s | user/sys CPU | max RSS | requests (items/req) |
+|---|---|---|---|---|---|
+| A pool16 | 47.3s | 8,449 | 7.7s / 1.0s | 397MB | 16,016 (25.0) |
+| A′ pool1 | 47.3s | 8,453 | 7.9s / 1.0s | 391MB | 16,010 (25.0) |
+| B mpmc | 47.9s | 8,352 | **5.4s** / 1.0s | 388MB | 16,024 (25.0) |
+| C task | **81.9s** | **4,883 (−42%)** | **14.7s / 4.7s** | 458MB | **18,661 (21.4)** |
+
+- **C collapses when the server (not the token bucket) is the bottleneck.**
+  With tokens plentiful, C drains the process channel instantly — there is
+  no queue-based backpressure — so the chunker's `recv_many` returns
+  partial chunks (21.4 items/request, +17% requests) and up to the full
+  semaphore (1024) requests pile onto a saturated server; its rate
+  oscillates 4.7k–9.4k/s while the pools hold a steady ~8k/s with exact
+  25-item batches. CPU is 2.4× the pools'. **New sub-hypothesis for the EC2
+  runs**: C needs either an in-flight cap far below 1024 or
+  chunker-side batching discipline; and on real (horizontally scaled)
+  DynamoDB an unreachable target manifests as throttling, so AIMD would
+  pull the target down and may mask much of this — the EC2 mixed/quota
+  cells must check which effect dominates
+- **B matched the pools' throughput with 8 workers instead of 16 and ~30%
+  less user CPU** — the work-conserving queue also removes the round-robin
+  try_send scanning. Positive signal for B on Q1/Q4
+- A vs A′: no measurable difference in either cell (queue depth is
+  irrelevant with uniform items — as designed; the mixed regime on EC2
+  remains the discriminator)
+- Operational notes: DynamoDB Local enforces the 40k/table and 80k/account
+  provisioned-capacity validations (two quota-scale tables cannot coexist —
+  the EC2 harness must serialize quota-scale cells account-wide, §3), and
+  without `-sharedDb` it namespaces tables per access key: dynein's
+  per-process temporary credentials made tables "vanish" between
+  invocations until static dummy credentials were exported
+
 ## 3. Workloads
 
 Discriminating power matters: with uniform items and ample WCU, *all*
