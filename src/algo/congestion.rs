@@ -167,7 +167,9 @@ pub fn estimate_safe_target(
 /// The user-specified target is a ceiling. When throttling is observed, the
 /// effective target is halved so that co-located production workloads take
 /// priority. While no throttling is observed, the effective target recovers
-/// gradually up to the ceiling.
+/// gradually up to the ceiling. A ceiling of `f64::INFINITY` means "no
+/// ceiling": pacing is then driven purely by throttle feedback (and requires
+/// a finite initial target, see `with_initial_target`).
 ///
 /// The controller can start below the ceiling when better information is
 /// available (e.g. the provisioned capacity of the table); the effective
@@ -203,10 +205,18 @@ impl AimdController {
         assert!(user_target > 0f64);
         assert!(min_target > 0f64);
         assert!(min_target <= user_target);
+        let effective_target = initial_target.clamp(min_target, user_target);
+        // An infinite effective target could never back off (halving infinity
+        // is still infinity), so an unbounded ceiling requires a finite
+        // starting point.
+        assert!(
+            effective_target.is_finite(),
+            "an unbounded ceiling requires a finite initial target"
+        );
         AimdController {
             user_target,
             min_target,
-            effective_target: initial_target.clamp(min_target, user_target),
+            effective_target,
             latest_decrease: None,
             latest_throttle: None,
             calm_since: now,
@@ -312,6 +322,48 @@ mod tests {
 
     fn controller(now: Instant) -> AimdController {
         AimdController::with_initial_target(USER_TARGET, USER_TARGET, MIN_TARGET, now)
+    }
+
+    #[test]
+    fn test_unbounded_ceiling_recovery_is_uncapped() {
+        // f64::INFINITY as the user target means "no ceiling": recovery keeps
+        // compounding upward forever, driven only by throttle feedback.
+        let now = Instant::now();
+        let mut c = AimdController::with_initial_target(f64::INFINITY, 100.0, MIN_TARGET, now);
+        assert_eq!(c.effective_target(), 100.0);
+        let step1 = 100.0 + 100.0 * RECOVERY_STEP_RATIO;
+        let t1 = now.add(JUST_AFTER_CALM);
+        assert_eq!(c.on_observation(10, 0, t1), Some(step1));
+        let step2 = step1 + step1 * RECOVERY_STEP_RATIO;
+        let t2 = t1.add(JUST_AFTER_CALM);
+        assert_eq!(c.on_observation(10, 0, t2), Some(step2));
+        assert!(c.effective_target().is_finite());
+    }
+
+    #[test]
+    fn test_unbounded_ceiling_throttle_still_halves() {
+        let now = Instant::now();
+        let mut c = AimdController::with_initial_target(f64::INFINITY, 100.0, MIN_TARGET, now);
+        assert_eq!(c.on_observation(10, 1, now), Some(50.0));
+        assert!(c.is_congested(now));
+    }
+
+    #[test]
+    fn test_unbounded_ceiling_boost_is_uncapped() {
+        let now = Instant::now();
+        let mut c = AimdController::with_initial_target(f64::INFINITY, 100.0, MIN_TARGET, now);
+        assert_eq!(c.boost_to(5000.0, now), Some(5000.0));
+        assert_eq!(c.effective_target(), 5000.0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_unbounded_ceiling_requires_finite_initial_target() {
+        // With no ceiling the effective target would start (and stay) at
+        // infinity: halving infinity is still infinity, so the controller
+        // could never back off. Callers must provide a finite starting point.
+        let now = Instant::now();
+        AimdController::with_initial_target(f64::INFINITY, f64::INFINITY, MIN_TARGET, now);
     }
 
     #[test]

@@ -52,7 +52,7 @@ pub struct Dynein {
     #[clap(long, verbatim_doc_comment)]
     pub shell: bool,
 
-    /// This option displays detailed information about third-party libraries, frameworks, and other components incorporated into dynein,    
+    /// This option displays detailed information about third-party libraries, frameworks, and other components incorporated into dynein,
     /// as well as the full license texts under which they are distributed.
     #[clap(long)]
     pub third_party_attribution: bool,
@@ -61,6 +61,19 @@ pub struct Dynein {
 // NOTE: need to be placed in the same module as Dynein struct
 pub fn initialize_from_args() -> Dynein {
     Dynein::parse()
+}
+
+/// Parses a strictly positive, finite floating point number (e.g. a WCU
+/// ceiling). Zero, negatives, infinities and NaN are configuration errors.
+fn parse_positive_finite_f64(s: &str) -> Result<f64, String> {
+    let value: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid number '{}': {}", s, e))?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(format!("'{}' must be a positive finite number", s))
+    }
 }
 
 pub fn parse_args<I, S>(input: I) -> Result<Sub, Box<dyn Error>>
@@ -381,6 +394,13 @@ pub enum Sub {
         /// Enable type inference for set types. This option is provided for backward compatibility.
         #[clap(long)]
         enable_set_inference: bool,
+
+        /// Maximum write capacity units (WCU) per second this import may consume.{n}
+        /// dynein starts from a realistic target derived from the table settings and probes upward, using this value as a hard ceiling.{n}
+        /// Set it to leave explicit headroom for production traffic on the same table.{n}
+        /// By default there is no ceiling: dynein's congestion control backs off on throttling and recovers on its own.
+        #[clap(long, value_parser = parse_positive_finite_f64, verbatim_doc_comment)]
+        max_wcu: Option<f64>,
     },
 
     /// Take backup of a DynamoDB table using on-demand backup
@@ -573,6 +593,51 @@ pub enum ConfigSub {
 #[cfg(test)]
 mod tests {
     use super::{parse_args, Sub};
+
+    #[test]
+    fn test_parse_import_max_wcu() {
+        let result = parse_args(vec![
+            "import",
+            "--input-file",
+            "in.jsonl",
+            "--format",
+            "jsonl",
+            "--max-wcu",
+            "500",
+        ])
+        .unwrap();
+        assert_eq!(
+            result,
+            Sub::Import {
+                input_file: "in.jsonl".to_owned(),
+                format: Some("jsonl".to_owned()),
+                enable_set_inference: false,
+                max_wcu: Some(500.0),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_import_max_wcu_defaults_to_none() {
+        let result = parse_args(vec!["import", "--input-file", "in.jsonl"]).unwrap();
+        assert_eq!(
+            result,
+            Sub::Import {
+                input_file: "in.jsonl".to_owned(),
+                format: None,
+                enable_set_inference: false,
+                max_wcu: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_import_rejects_invalid_max_wcu() {
+        for bad in ["0", "-5", "abc", "inf", "NaN"] {
+            let result = parse_args(vec!["import", "--input-file", "in.jsonl", "--max-wcu", bad]);
+            assert!(result.is_err(), "--max-wcu {} should be rejected", bad);
+        }
+    }
 
     #[test]
     fn test_parse_args() {

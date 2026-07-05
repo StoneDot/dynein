@@ -215,6 +215,35 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
   error-position semantics; an integration test pins "invalid jsonl document
   aborts with the admitted prefix written"
 
+### 4.12 `--max-wcu` CLI option; no ceiling by default (2026-07-05)
+
+- **Decision**: `dy import --max-wcu <N>` sets the congestion controller's
+  user ceiling. **When the option is absent there is no ceiling at all**
+  (previously a hardcoded `100_000.0`): pacing is left entirely to the
+  congestion control — known-information initial target (§4.6), AIMD
+  throttle feedback (§4.6), CloudWatch informed recovery (§4.7). The
+  ceiling exists for the user who wants to *impose* a bound (e.g. explicit
+  headroom for production traffic), not as a built-in constant
+- **Representation**: "no ceiling" is `f64::INFINITY` through the existing
+  `f64` plumbing, so none of the executor signatures change (they are
+  frozen for the benchmark). The arithmetic is exact: clamping into
+  `[min, ∞]` keeps the initial target, recovery `min(∞)` never caps,
+  `boost_to` `min(∞)` never caps, and halving stays finite — **as long as
+  the effective target starts finite**. That is the one hazard: an infinite
+  effective target could never back off (∞ × 0.5 = ∞), so
+  `AimdController::with_initial_target` now asserts a finite starting
+  point, and `resolve_target_ceiling` (transfer.rs) backfills a missing
+  capacity hint with the warm default (4,000) whenever the ceiling is
+  unbounded. With an explicit ceiling, a missing hint still means "start at
+  the ceiling", as before
+- **Validation**: clap rejects zero, negatives, NaN and infinities
+  (positive-finite parser); unbounded is expressible only by omitting the
+  option
+- **Verified**: on DynamoDB Local, no option → `effective target 4000.00
+  (ceiling: inf)`, ~4k items/s (the on-demand initial target pacing),
+  exit 0; `--max-wcu 100` → a steady ~100 items/s for ~1KB items
+  (client-side bucket pacing), 15s wall clock for 1,500 items, exit 0
+
 ## 5. Groundwork for Future Design (not implemented, but direction-setting)
 
 ### 5.1 Multi-table / GSI support: vectorizing the resource
@@ -358,7 +387,7 @@ rules). Summary:
 3. ~~CloudWatch slow control loop (informed recovery)~~ (done; §4.7)
 4. Settle the executor/chunker architecture via benchmark (§5.4, `benchmark-plan.md`) ← next
 5. Foundation generalization: resource vectorization (§5.1), move generic parts of `BatchWriteProcess` into algo, reduce `expect`s, scale-in
-6. Finish import: ~~streaming file reads + semaphore admission control (§5.2 → §4.11)~~ (done); a `--max-wcu`-style CLI option (currently hardcoded to `100_000.0`) remains
+6. ~~Finish import: streaming file reads + semaphore admission control (§5.2 → §4.11), `--max-wcu` CLI option (§4.12)~~ (done)
 7. Parallel scan for export (RCU variant, separate branch)
 8. Squash, sign, and tidy up the wip commits
 

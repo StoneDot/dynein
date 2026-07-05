@@ -30,6 +30,15 @@ Options:
       --enable-set-inference
           Enable type inference for set types. This option is provided for backward compatibility
 
+      --max-wcu <MAX_WCU>
+          Maximum write capacity units (WCU) per second this import may consume.
+          
+          dynein starts from a realistic target derived from the table settings and probes upward, using this value as a hard ceiling.
+          
+          Set it to leave explicit headroom for production traffic on the same table.
+          
+          By default there is no ceiling: dynein's congestion control backs off on throttling and recovers on its own.
+
   -r, --region <REGION>
           The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region local`.
           You can use --region option in both top-level and subcommand-level.
@@ -72,6 +81,15 @@ Options:
 
       --enable-set-inference
           Enable type inference for set types. This option is provided for backward compatibility
+
+      --max-wcu <MAX_WCU>
+          Maximum write capacity units (WCU) per second this import may consume.
+          
+          dynein starts from a realistic target derived from the table settings and probes upward, using this value as a hard ceiling.
+          
+          Set it to leave explicit headroom for production traffic on the same table.
+          
+          By default there is no ceiling: dynein's congestion control backs off on throttling and recovers on its own.
 
   -r, --region <REGION>
           The region to use (e.g. --region us-east-1). When using DynamodB Local, use `--region local`.

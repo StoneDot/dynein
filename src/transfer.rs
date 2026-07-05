@@ -300,11 +300,32 @@ pub async fn export(
     Ok(())
 }
 
+/// Resolves the congestion controller ceiling and the capacity hints from
+/// the optional --max-wcu. No --max-wcu means **no ceiling**: pacing is left
+/// entirely to the congestion control (known-information initial target +
+/// AIMD throttle feedback + the CloudWatch slow loop). An unbounded ceiling
+/// requires a finite starting point (the controller asserts this: an
+/// infinite effective target could never back off), so a missing capacity
+/// hint is backfilled with the conservative warm default.
+fn resolve_target_ceiling(max_wcu: Option<f64>, hints: CapacityHints) -> (f64, CapacityHints) {
+    match max_wcu {
+        Some(ceiling) => (ceiling, hints),
+        None => (
+            f64::INFINITY,
+            CapacityHints {
+                initial_wcu: hints.initial_wcu.or(Some(DEFAULT_ON_DEMAND_WARM_WCU)),
+                ..hints
+            },
+        ),
+    }
+}
+
 pub async fn import(
     cx: &app::Context,
     input_file: String,
     format: Option<String>,
     enable_set_inference: bool,
+    max_wcu: Option<f64>,
 ) -> Result<(), batch::DyneinBatchError> {
     let format_str: Option<&str> = format.as_deref();
 
@@ -330,12 +351,12 @@ pub async fn import(
 
     // Give the AIMD congestion control a realistic starting point and a
     // capacity reference derived from known table information instead of the
-    // (high) user-specified ceiling.
+    // user-specified ceiling (which is unbounded unless --max-wcu is given).
     let hints = capacity_hints(cx, &ts).await;
+    let (max_wcu, hints) = resolve_target_ceiling(max_wcu, hints);
 
     match format_str {
         None | Some("json") | Some("json-compact") => {
-            // TODO: to change configurable
             stream_writes_with_chucked(
                 cx,
                 move |sink| {
@@ -344,7 +365,7 @@ pub async fn import(
                         sink(batch::construct_put_write_request(item))
                     })
                 },
-                100_000.0,
+                max_wcu,
                 hints,
             )
             .await?;
@@ -358,7 +379,7 @@ pub async fn import(
                         sink(batch::construct_put_write_request(item))
                     })
                 },
-                100_000.0,
+                max_wcu,
                 hints,
             )
             .await?;
@@ -369,7 +390,7 @@ pub async fn import(
                 move |sink| {
                     stream_csv_rows(std::io::BufReader::new(file), enable_set_inference, sink)
                 },
-                100_000.0,
+                max_wcu,
                 hints,
             )
             .await?;
@@ -1828,6 +1849,56 @@ mod tests {
         assert!(v["tokio"]["total_poll_duration_us"].is_u64());
         assert!(v["tokio"]["total_scheduled_duration_us"].is_u64());
         assert!(v["tokio"]["total_slow_poll_count"].is_u64());
+    }
+
+    #[test]
+    fn test_resolve_target_ceiling_uses_user_value_as_is() {
+        let hints = CapacityHints {
+            initial_wcu: Some(80.0),
+            provisioned_wcu: Some(100.0),
+        };
+        let (ceiling, resolved) = resolve_target_ceiling(Some(500.0), hints);
+        assert_eq!(ceiling, 500.0);
+        assert_eq!(resolved.initial_wcu, Some(80.0));
+        assert_eq!(resolved.provisioned_wcu, Some(100.0));
+    }
+
+    #[test]
+    fn test_resolve_target_ceiling_is_unbounded_by_default() {
+        // Without --max-wcu, pacing is left to the congestion control alone.
+        let hints = CapacityHints {
+            initial_wcu: Some(80.0),
+            provisioned_wcu: Some(100.0),
+        };
+        let (ceiling, resolved) = resolve_target_ceiling(None, hints);
+        assert_eq!(ceiling, f64::INFINITY);
+        assert_eq!(resolved.initial_wcu, Some(80.0));
+    }
+
+    #[test]
+    fn test_resolve_target_ceiling_unbounded_backfills_missing_initial() {
+        // An unbounded ceiling with no capacity hint would start the
+        // controller at infinity (which can never back off), so a missing
+        // hint is backfilled with the conservative warm default.
+        let hints = CapacityHints {
+            initial_wcu: None,
+            provisioned_wcu: None,
+        };
+        let (ceiling, resolved) = resolve_target_ceiling(None, hints);
+        assert_eq!(ceiling, f64::INFINITY);
+        assert_eq!(resolved.initial_wcu, Some(DEFAULT_ON_DEMAND_WARM_WCU));
+    }
+
+    #[test]
+    fn test_resolve_target_ceiling_bounded_keeps_missing_initial() {
+        // With an explicit ceiling the executor may start at it, as before.
+        let hints = CapacityHints {
+            initial_wcu: None,
+            provisioned_wcu: None,
+        };
+        let (ceiling, resolved) = resolve_target_ceiling(Some(500.0), hints);
+        assert_eq!(ceiling, 500.0);
+        assert_eq!(resolved.initial_wcu, None);
     }
 
     fn collect_json_values(
