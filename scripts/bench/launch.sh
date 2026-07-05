@@ -136,9 +136,23 @@ for executor in matrix["executors"]:
                 "reps": reps,
                 "budget_secs": work_secs + 300,
             })
-# Round-robin shard assignment; both instance types run all shards (Q6).
-for i, cell in enumerate(cells):
-    cell["shard"] = i % num_shards
+# Shard assignment. All quota-scale cells go to the LAST shard so that at
+# most one high-WCU table exists at any moment, account-wide per instance
+# type: run_cells.sh reuses one shared table per (wcu, shard) and runs its
+# cells serially, so concentrating the expensive cells in a single shard
+# makes the 39k-WCU capacity strictly serial regardless of how the billing
+# meters short-lived provisioned capacity (hourly rounding, sampling, or
+# proration — see benchmark-plan.md §8). Cheap cells round-robin across the
+# remaining shards. Both instance types run all shards (Q6).
+EXPENSIVE_WCU = 1000  # keep in sync with REUSE_WCU_THRESHOLD in run_cells.sh
+cheap_shards = max(1, num_shards - 1) if num_shards > 1 else 1
+i_cheap = 0
+for cell in cells:
+    if cell["wcu"] >= EXPENSIVE_WCU and num_shards > 1:
+        cell["shard"] = num_shards - 1
+    else:
+        cell["shard"] = i_cheap % cheap_shards
+        i_cheap += 1
 json.dump({
     "run_id": run_id,
     "commit_sha": commit_sha,
