@@ -74,7 +74,11 @@ cleanup() {
         log "deleting leftover table $t"
         aws dynamodb delete-table --region "$REGION" --table-name "$t" >/dev/null 2>&1
     done
-    # Best-effort: upload whatever partial artifacts exist.
+    # Best-effort: upload whatever partial artifacts exist, plus the boot
+    # log — the instance self-terminates, so this is the only post-mortem
+    # trail when a run dies mid-way (there is no SSH/SSM on the fleet).
+    mkdir -p "$WORK_DIR/artifacts"
+    cp /var/log/dynein-bench.log "$WORK_DIR/artifacts/boot-shard-$SHARD.log" 2>/dev/null || true
     if [ -d "$WORK_DIR/artifacts" ]; then
         aws s3 cp --recursive "$WORK_DIR/artifacts" "$S3_PREFIX/" >/dev/null 2>&1
     fi
