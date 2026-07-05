@@ -210,3 +210,7 @@ rules). Summary:
 - `036b98c` re-queueing on retryable errors + transport error policy
 - `1f2d0a2` over-scale-out suppression
 - `cfacfee` item accounting model (summarize) + unbounded retry + permanent-failure termination (implements §3 and §4 of this document)
+- `44d64c8` AIMD fast loop + progress deadline (§4.6, §4.8)
+- `83e73fc` AIMD timing tuning + known-information initial target (§4.6)
+- `f11ac21` CloudWatch slow control loop (§4.7)
+- `8c3584d` algo layer on `tokio::time::Instant` (virtual-time simulation prep; see `benchmark-plan.md` §2.5)

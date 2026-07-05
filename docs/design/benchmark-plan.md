@@ -7,6 +7,22 @@
 This document is deliberately detailed so that the work can be resumed from
 scratch (by a human or an agent) without the original conversation context.
 
+## 0. Current Status (checklist)
+
+**Nothing has been executed yet** — neither the simulation scenarios nor any
+EC2/quota-scale AWS runs. Do not launch EC2 instances or create quota-scale
+tables until the simulation phase is done and the user approves the fleet
+run.
+
+- [x] Algo layer migrated to `tokio::time::Instant` so it runs under virtual
+  time (commit `8c3584d`) — the only preparation done so far
+- [ ] Candidate switch: A′ (queue depth 1), B (needs `async-channel` dep),
+  C prototype; runtime selection via `DYNEIN_BENCH_EXECUTOR`
+- [ ] Simulation scenarios implemented and run (§2.5) → record predictions
+- [ ] Stats emitter, tokio-metrics integration, input generator
+- [ ] Harness scripts + S3 bucket + IAM instance profile
+- [ ] Tier-1 EC2 sweep → decision per §7
+
 ## 1. Questions to Answer
 
 - **Q1 (executor topology)**: Is the current fixed worker pool with per-worker
@@ -47,6 +63,13 @@ scratch (by a human or an agent) without the original conversation context.
 Chunker variants (Q5, combined only with A/A′/B): `single` (current) vs
 `multi8` (the async-channel branch approach).
 
+**Granularity note for C**: the task unit is one BatchWriteItem *request*
+(≤25 items), never one item. Per-item tasks would mean millions of spawns
+for large imports (seconds of pure overhead plus memory) and the 25-item
+chunking is needed for the API anyway — the request is the natural unit.
+Spawn cost (~µs, a few hundred bytes) is three orders of magnitude below the
+5–50 ms network call it wraps.
+
 **Per-regime hypotheses (to falsify)** — each candidate is expected to have a
 regime where it wins, and the workloads are designed around these:
 
@@ -73,8 +96,29 @@ execute in milliseconds).
   configurable cost and simulated latency; a scenario runner that feeds the
   same request sequence (deterministic seed) to each candidate executor and
   records completion timestamps and consumed-capacity integrals
+- **Server model, phase 1 — infinite capacity on purpose**: the simulated
+  "server" only adds latency; every request consumes exactly its estimate
+  (`actual == estimate`, never throttled). This deliberately isolates the
+  *client-side* questions (token scheduling across split vs shared buckets,
+  queue skew, tails): the throughput ceiling is the client target itself,
+  AIMD stays inert, and the retry path (which lives in transfer.rs, not in
+  the executor under test) stays out of the picture. A phase-2 variant with
+  a server-side bucket returning partial grants can be added later to
+  exercise AIMD dynamics per topology — do not mix the two phases
 - **Scenarios** = the three regimes of the hypothesis table above, plus a
   low-rate variant (the regime where queue-depth hostage-taking is worst)
+- **Metrics per scenario run**: makespan; utilization = ideal time
+  (Σcost ÷ target rate) ÷ makespan; completion tail = t(100%) − t(90%);
+  request completion timeline for plotting. Assertions in the test code
+  check only completeness (all requests finished) — the comparative numbers
+  are printed, not asserted, so a falsified hypothesis does not "break the
+  build"
+- **Implementation hooks required**: a queue-depth parameter on
+  `ThrottledExecutor` (for A′; currently `CHANNEL_BUFFER_SIZE` is a const),
+  the `async-channel` dependency (for B), and the C prototype. Determinism
+  notes: `start_paused` implies the current-thread runtime; the worker
+  spawn-jitter uses `rand::random`, which is acceptable noise but can be
+  seeded if runs must be exactly reproducible
 - **What simulation can and cannot decide**: it isolates scheduling and
   token-bucket semantics (queue skew, token waste, tails). It **cannot**
   observe CPU cost, cache effects, or lock contention — virtual time hides
