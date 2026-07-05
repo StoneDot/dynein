@@ -40,8 +40,23 @@ run.
   executors). Beware: two earlier runs produced no throttling at all
   because burst capacity re-accumulated within minutes — drain immediately
   before measuring (§8)
-- [ ] S3 bucket + IAM instance profile created (run `setup_aws.sh` once)
-- [ ] Tier-1 EC2 sweep → decision per §7
+- [x] S3 bucket + IAM instance profile created (2026-07-05:
+  `s3://dynein-bench-975049903426`, instance profile
+  `dynein-bench-instance` incl. SSM Session Manager). Bench runs in
+  **us-west-2** (m9g availability + price); throwaway bench VPC
+  vpc-0226c40be3d4c7086
+- [ ] Tier-1 EC2 sweep → decision per §7. **First attempt (run
+  20260705-090552, m9g-only, aborted 2026-07-05):** 7 result.json salvaged
+  (w10 cells + 2× pool16-quota-small reps, all exit 0 with full
+  instrumentation). Aborted because `dy import` OOM-killed on the 8.5GB
+  quota-mixed input — the non-streaming reader needs ~2× the file size in
+  RAM (15.6GB RSS / 16GB instance). **Streaming reads (roadmap 6) are now
+  a prerequisite for the quota-scale mixed/large cells.** Operational
+  fixes that came out of the attempt are already committed: user-data HOME
+  bug, 100GB root volume, shared input seeds, upfront input generation,
+  billing-safe serial quota table, SSM access, boot-log upload. Both
+  instances are preserved (stopped-protected) for further post-mortem;
+  the DynamoDB tables were deleted within ~34 minutes of creation
 
 ## 1. Questions to Answer
 

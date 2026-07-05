@@ -266,6 +266,18 @@ rules). Summary:
   against a saturated server — while B matches the pools with half the
   workers and ~30% less CPU. Recorded as sub-hypotheses for the EC2 runs
 
+- **Non-streaming file reads are a hard scale blocker (EC2 run 090552,
+  aborted)**: `dy import` reads the whole input into memory
+  (`fs::read_to_string` + full deserialization). An 8.5GB mixed-size JSONL
+  input drove dy to 15.6GB RSS on a 16GB m9g.xlarge and the kernel
+  OOM-killed it 22 seconds after "Loaded a file"; systemd took the whole
+  runner unit down with it (SIGKILL → no cleanup trap), leaving the
+  39k-WCU table idling. Verified from the kernel log via SSM. Consequence:
+  **roadmap item 6 (streaming reads + semaphore admission control, §5.2)
+  is a prerequisite for the quota-scale mixed/large benchmark cells**, not
+  a nice-to-have that can wait until after the benchmark. The quota-scale
+  uniform-small cells (1.3GB) and everything at 10 WCU ran fine
+
 ### 2026-07-04
 
 - The old implementation (missing retry re-queueing) reproducibly **hung forever at 561/2000** on a 2-WCU table with 2000 items. About 57 fully-throttled requests × 25 items ≈ 1439 items were silently lost
