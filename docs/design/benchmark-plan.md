@@ -1,8 +1,8 @@
 # Benchmark Plan: Executor/Chunker Architecture for Throttled Import
 
-- Status: Planned (not executed yet)
+- Status: Gates passed (G0–G2 incl. two canary runs); Tier-1 sweep (G3) pending user approval
 - Parent document: `import-throttling.md` (see §5.3/§5.4 there for the open questions this plan settles)
-- Last updated: 2026-07-05 (rev 2: per-regime hypotheses, quota-scale WCU, deep observability)
+- Last updated: 2026-07-05 (rev 3: streaming-read prerequisite resolved, gates/watchdog implemented, canary ×2 passed)
 
 This document is deliberately detailed so that the work can be resumed from
 scratch (by a human or an agent) without the original conversation context.
@@ -14,10 +14,10 @@ scratch (by a human or an agent) without the original conversation context.
 
 ## 0. Current Status (checklist)
 
-**Nothing has been executed yet** — neither the simulation scenarios nor any
-EC2/quota-scale AWS runs. Do not launch EC2 instances or create quota-scale
-tables until the simulation phase is done and the user approves the fleet
-run.
+**As of 2026-07-05 evening: everything up to and including the G2 canary is
+done.** The Tier-1 fleet sweep (G3 staged scale-up) is the only remaining
+execution step; it launches at the canary-verified HEAD and still requires
+explicit user approval per run.
 
 - [x] Algo layer migrated to `tokio::time::Instant` so it runs under virtual
   time (commit `8c3584d`)
@@ -50,15 +50,27 @@ run.
   `dynein-bench-instance` incl. SSM Session Manager). Bench runs in
   **us-west-2** (m9g availability + price); throwaway bench VPC
   vpc-0226c40be3d4c7086
-- [ ] Tier-1 EC2 sweep → decision per §7. **First attempt (run
+- [x] Streaming reads + admission control landed (roadmap 6,
+  `import-throttling.md` §4.11): the OOM prerequisite for the quota-scale
+  mixed/large cells is resolved — max RSS is input-size-independent
+  (~20MB), verified locally (30MB/300MB) and on EC2 (canary, 217MB input)
+- [x] Postmortem gates implemented and mechanically enforced
+  (`benchmark-run-postmortem.md` implementation-status note): preflight
+  auto-run, canary PASS marker required for full `--execute`, watchdog
+  with abort authority, OnFailure guardian, MemoryMax scope per rep,
+  heartbeats, S3 input cache, system-level 1s samplers per cell
+- [x] **G2 canary passed twice (2026-07-05)**: run 20260705-160713
+  (surfaced an IAM region-scope regression — fixed + preflight check
+  added) and run 20260705-165707 (clean, ~21 min, ~$0.06 DDB; all
+  samplers and diagnostics verified). PASS marker current for HEAD
+- [ ] Tier-1 EC2 sweep (G3 staged: w10-only matrix → single quota-small
+  rep → full quota block) → decision per §7. **First attempt (run
   20260705-090552, m9g-only, aborted 2026-07-05):** 7 result.json salvaged
   (w10 cells + 2× pool16-quota-small reps, all exit 0 with full
   instrumentation). Aborted because `dy import` OOM-killed on the 8.5GB
-  quota-mixed input — the non-streaming reader needs ~2× the file size in
-  RAM (15.6GB RSS / 16GB instance). **Streaming reads (roadmap 6) are now
-  a prerequisite for the quota-scale mixed/large cells.** Operational
-  fixes that came out of the attempt are already committed: user-data HOME
-  bug, 100GB root volume, shared input seeds, upfront input generation,
+  quota-mixed input (non-streaming reader; since fixed, see above).
+  Operational fixes from the attempt are committed: user-data HOME bug,
+  100GB root volume, shared input seeds, upfront input generation,
   billing-safe serial quota table, SSM access, boot-log upload. Both
   instances are preserved (stopped-protected) for further post-mortem;
   the DynamoDB tables were deleted within ~34 minutes of creation

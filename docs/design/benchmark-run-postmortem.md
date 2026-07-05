@@ -10,8 +10,21 @@
   heartbeat age / external cell deadlines, abort authority verified by
   mock-driven self-tests in `scripts/bench/tests/`), §4.4 `systemd-run`
   MemoryMax scope per rep + `OnFailure=` guardian unit
-  (`instance_cleanup.sh`), §4.5 per-minute heartbeats. The canary itself has
-  not been run yet (it is the next billed step)
+  (`instance_cleanup.sh`), §4.5 per-minute heartbeats.
+- **Canary executed twice (2026-07-05, later the same day)**, both 8/8
+  verify-PASS at ~$0.2 each. Run 20260705-160713 immediately earned its
+  keep: it surfaced an IAM regression (a `setup_aws.sh` re-run silently
+  narrowed the DynamoDB resource ARN back to its `$REGION` default while
+  the fleet runs in us-west-2 — a 15-minute create-table retry stall,
+  self-healed after an in-place policy fix). Lessons fed back mechanically:
+  the policy template is region-wildcarded, preflight now parses the live
+  role policy for region coverage (the IAM simulator is unusable from an
+  Organizations member account — spurious implicitDeny), the runner's
+  journald log is salvaged on every exit (it was failure-path-only, so the
+  stall left no uploaded trace), and `create-table.err` appends across
+  retries instead of letting the eventual success erase the evidence. Run
+  20260705-165707 then passed cleanly (~21 min) and validated the added
+  system-level samplers (%steal, disk queue depth, page cache, netdev)
 - Scope: the *process* failures of the four EC2 launch attempts
   (runs 084300, 085028, 090224, 090552), not the product OOM bug they
   surfaced (that finding lives in `import-throttling.md` §6)
