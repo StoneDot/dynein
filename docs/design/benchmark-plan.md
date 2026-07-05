@@ -2,7 +2,7 @@
 
 - Status: Planned (not executed yet)
 - Parent document: `import-throttling.md` (see §5.3/§5.4 there for the open questions this plan settles)
-- Last updated: 2026-07-05
+- Last updated: 2026-07-05 (rev 2: per-regime hypotheses, quota-scale WCU, deep observability)
 
 This document is deliberately detailed so that the work can be resumed from
 scratch (by a human or an agent) without the original conversation context.
@@ -41,14 +41,50 @@ scratch (by a human or an agent) without the original conversation context.
 |----|----------|-------|
 | A  | Current: fixed pool, per-worker queue (depth 16), round-robin `try_send` with skip-on-full, split buckets (`target/n`) | Baseline = branch HEAD |
 | A′ | A with per-worker queue depth 1 (`CHANNEL_BUFFER_SIZE` 16→1) | One-line change; isolates the queue-depth-skew effect (Q3) |
+| B  | Shared MPMC process queue (async-channel), fixed workers pulling, split buckets | Work-conserving queueing while keeping the pool model |
 | C  | Task-per-request: chunker acquires a `Semaphore` permit (max concurrency = current `DEFAULT_MAX_CONCURRENT_CONNECTION`), spawns one tokio task per BatchWriteItem request, **shared bucket** (single rate limiter), AIMD updates the shared refill directly | Removes Signal channels, round-robin, and all scale-out logic; concurrency emerges from rate × latency. Reuses `ResourceConstraintProcess` unchanged |
-| B  | Shared MPMC process queue (async-channel), fixed workers pulling, split buckets | Reserve: only evaluated if C is disqualified but A's queueing is proven bad |
 
 Chunker variants (Q5, combined only with A/A′/B): `single` (current) vs
 `multi8` (the async-channel branch approach).
 
-**Prediction to falsify**: C matches or beats A on throughput and token waste
-with drastically less code; A retains an edge only in CPU time, if anywhere.
+**Per-regime hypotheses (to falsify)** — each candidate is expected to have a
+regime where it wins, and the workloads are designed around these:
+
+| Regime | Expected winner | Reasoning |
+|--------|-----------------|-----------|
+| Many small uniform items (high request rate) | **A** | Per-request overhead ratio is highest here; the pool amortizes distribution and avoids per-request spawns; a shared queue/bucket sees its highest contention |
+| Small and large items randomly mixed | **B** | The shared queue is work-conserving (no hostage batches behind a big one), while the fixed pool still amortizes overhead |
+| Mostly large items | **C** | Long, variable per-request service times; scheduling flexibility dominates and spawn overhead is fully negligible |
+
+A dissenting sub-hypothesis worth recording: C may also win the mixed regime
+(shared *bucket* removes token waste that B — split buckets — still has).
+The simulation and the EC2 runs arbitrate; whichever way it falls, the
+result closes the question.
+
+## 2.5 Simulation Phase (before any EC2 run)
+
+Build the per-regime scenarios as **deterministic in-process simulations**
+first, using tokio virtual time (`#[tokio::test(start_paused = true)]`; the
+algo layer uses `tokio::time::Instant` throughout, so bucket refills, AIMD
+timing and scale-out all run under paused time — minutes of simulated time
+execute in milliseconds).
+
+- **Setup**: a `SimProcess` implementing `ResourceConstraintProcess` with a
+  configurable cost and simulated latency; a scenario runner that feeds the
+  same request sequence (deterministic seed) to each candidate executor and
+  records completion timestamps and consumed-capacity integrals
+- **Scenarios** = the three regimes of the hypothesis table above, plus a
+  low-rate variant (the regime where queue-depth hostage-taking is worst)
+- **What simulation can and cannot decide**: it isolates scheduling and
+  token-bucket semantics (queue skew, token waste, tails). It **cannot**
+  observe CPU cost, cache effects, or lock contention — virtual time hides
+  them. Therefore a simulated "A loses everywhere" would NOT disqualify A:
+  A's hypothesized edge (small-uniform regime) is precisely the CPU-bound
+  one and can only be confirmed on EC2. Record simulated results as
+  predictions for the EC2 runs, not verdicts
+- **Location**: `src/algo/sim.rs` (test-only module), scenarios as
+  `#[ignore]`d tests run manually with
+  `cargo test --bin dy sim_ -- --ignored --nocapture`
 
 ## 3. Workloads
 
@@ -56,10 +92,17 @@ Discriminating power matters: with uniform items and ample WCU, *all*
 candidates will sit at the target and look identical. The differences only
 appear under heterogeneity and low per-worker rates.
 
-- **Item mix**
-  - `uniform`: ~110 B items (1 WCU each)
-  - `mixed`: 90% × 110 B + 10% × ~20 KB (20 WCU each) — drives Q2/Q3
-- **Table WCU (provisioned)**: 2 / 10 / 100
+- **Item mix** (mirrors the per-regime hypotheses)
+  - `uniform-small`: ~110 B items (1 WCU each) — A's regime
+  - `mixed`: 90% × 110 B + 10% × ~20 KB (20 WCU each), randomly interleaved — B's regime, drives Q2/Q3
+  - `uniform-large`: ~20–50 KB items — C's regime
+- **Table WCU (provisioned)**: 2 / 10 / 100 for the low/mid regimes, plus
+  high-rate cells at **1,000 / 10,000 / up to the account quota** (e.g.
+  40,000) for the small-uniform regime — the current assumptions saturate
+  far below where per-request overhead could matter. Cost stays small
+  because every cell creates its provisioned table immediately before the
+  run and deletes it right after completion (a 40k-WCU table at
+  ~US$0.0007/WCU-h costs ~US$0.50/min — cells are minutes long)
 - **Pseudo production**: off / on (rate = 50% of table WCU, using
   `scripts/pseudo_prod_writer.py`) — exercises AIMD + slow-loop interplay per
   architecture
@@ -69,8 +112,9 @@ appear under heterogeneity and low per-worker rates.
 
 **Tiering** (the full cross-product is too large to run at once):
 
-- **Tier 1** (settles Q1–Q4): executors {A, A′, C} × WCU {2, 100} × mix
-  {uniform, mixed} × prod off × 3 reps = 36 cells ≈ 4 h serial per instance
+- **Tier 1** (settles Q1–Q4): executors {A, A′, B, C} × WCU {10, quota-scale}
+  × mix {uniform-small, mixed, uniform-large} × prod off × 3 reps = 72 cells;
+  shard across instances to keep wall-clock in the a-few-hours range
 - **Tier 2** (production interplay): winner of Tier 1 + A, × WCU {10} × mix
   {uniform} × prod on × 3 reps
 - **Tier 3** (Q5, only if a pool topology won): chunker {single, multi8} on
@@ -91,6 +135,25 @@ Each run must produce a machine-readable JSON result (plus the raw log):
   ∫consumed during saturated periods
 - CPU user/sys time and max RSS (`/usr/bin/time -v`) — settles Q4
 - Run metadata: candidate ID, workload cell, commit SHA, instance type, run id
+
+To maximize what each (expensive) run teaches us, every EC2 cell also
+collects deep-dive artifacts:
+
+- **Flame graph**: `perf record -F 99 -g` on the `dy` process →
+  `perf script | stackcollapse | flamegraph.pl` (or `cargo flamegraph`).
+  Build with the existing `[profile.prof]` (release + `debug = 1`) so
+  symbols survive. Answers *where* CPU time differences come from, not just
+  how big they are
+- **tokio task metrics** (`tokio-metrics` crate): wrap each candidate's task
+  paths in `TaskMonitor`s (pool workers vs spawned request tasks) and dump
+  interval snapshots (poll counts, mean poll duration, scheduled delay,
+  slow-poll ratio) into the stats stream. Runtime-level metrics
+  (`RuntimeMonitor`) additionally need `RUSTFLAGS="--cfg tokio_unstable"` —
+  enable it for bench builds only
+- **System sampling**: `pidstat 1` (CPU%, RSS) and optionally
+  `perf stat` (IPC, cache misses — the affinity question Q4 in hard numbers)
+
+All artifacts upload to the same S3 prefix as the JSON results.
 
 **Instrumentation prerequisite**: a lightweight stats emitter in `dy`
 (e.g. env var `DYNEIN_BENCH_STATS=<path>` making the monitoring task append a
@@ -172,25 +235,33 @@ Safety nets:
 
 ## 6. Prerequisite Work Items (before the first fleet run)
 
-1. **Candidate switch**: implement A′ and C selectable at runtime (env var
-   `DYNEIN_BENCH_EXECUTOR=pool16|pool1|task`) so one binary per arch covers
-   all candidates; C is a prototype module beside `ThrottledExecutor`
-   implementing the same "consume `Receiver<T>`, respect AIMD" contract
-2. **Stats emitter** (`DYNEIN_BENCH_STATS`, §4)
-3. **Input generator** for the item mixes with deterministic seeds (extend
+1. **Candidate switch**: implement A′, B and C selectable at runtime (env var
+   `DYNEIN_BENCH_EXECUTOR=pool16|pool1|mpmc|task`) so one binary per arch
+   covers all candidates; B needs the `async-channel` dependency; C is a
+   prototype module beside `ThrottledExecutor` implementing the same
+   "consume `Receiver<T>`, respect AIMD" contract
+2. **Simulation phase** (§2.5): `SimProcess` + scenario runner + the four
+   regime scenarios, recording predicted winners before any EC2 spend
+3. **Stats emitter** (`DYNEIN_BENCH_STATS`, §4)
+4. **tokio-metrics integration** (TaskMonitors per candidate path; bench-only
+   `tokio_unstable` build flag for runtime metrics)
+5. **Input generator** for the item mixes with deterministic seeds (extend
    the existing scratchpad generators into `scripts/bench/gen_input.py`)
-4. **Harness scripts** (`scripts/bench/`): user-data template, launch.sh,
-   collect.sh, analyze.py, sweep.sh
-5. S3 bucket + IAM role/instance profile (one-time setup, document ARNs in
+6. **Harness scripts** (`scripts/bench/`): user-data template (installs
+   perf/flamegraph tooling), launch.sh, collect.sh, analyze.py, sweep.sh
+7. S3 bucket + IAM role/instance profile (one-time setup, document ARNs in
    `CLAUDE.local.md` once created)
 
 ## 7. Decision Rules
 
-- Adopt **C** if, across all Tier-1 cells: throughput ≥ A − 3%, token waste ≤
-  A, and CPU time ≤ 1.5 × A. Rationale: C deletes a large amount of executor
-  code, so it wins ties
-- If C is disqualified, evaluate **B**, and keep whichever of A/A′ measured
-  better as the fallback
+- Score every candidate per regime (throughput, token waste, tail, CPU
+  time). Adopt the candidate with **no disqualifying regression in any
+  regime** (>10% throughput loss or >2× CPU) and the best aggregate;
+  simplicity breaks ties (C > B > A′ > A — C deletes the most code)
+- If winners genuinely split by regime with large margins, a regime switch
+  (pick the executor from the average item size, which is known after
+  parsing the input) may be considered — but only with strong evidence;
+  the added complexity must pay for itself
 - Chunker multi8 (Q5) is adopted only if it improves throughput ≥ 5% on the
   winning pool topology (it adds a dependency and complexity)
 - Record the outcome and the numbers in `import-throttling.md` §6 and close
