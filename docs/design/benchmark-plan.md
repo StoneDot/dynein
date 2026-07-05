@@ -15,12 +15,20 @@ tables until the simulation phase is done and the user approves the fleet
 run.
 
 - [x] Algo layer migrated to `tokio::time::Instant` so it runs under virtual
-  time (commit `8c3584d`) — the only preparation done so far
-- [ ] Candidate switch: A′ (queue depth 1), B (needs `async-channel` dep),
-  C prototype; runtime selection via `DYNEIN_BENCH_EXECUTOR`
-- [ ] Simulation scenarios implemented and run (§2.5) → record predictions
-- [ ] Stats emitter, tokio-metrics integration, input generator
-- [ ] Harness scripts + S3 bucket + IAM instance profile
+  time (commit `8c3584d`)
+- [x] Candidate switch: A′ (queue depth 1), B (`async-channel`), C
+  (`src/algo/task_executor.rs`); runtime selection via
+  `DYNEIN_BENCH_EXECUTOR=pool16|pool1|mpmc|task` (`src/algo/executor.rs`,
+  default is `pool16` = the current architecture)
+- [x] Simulation scenarios implemented and run (§2.5) → predictions recorded
+  in §2.6. Byproduct: a real bucket bug found and fixed (see §2.6)
+- [x] Stats emitter (`DYNEIN_BENCH_STATS=<path>`, 1-second JSONL; schema in
+  `scripts/bench/analyze.py`), tokio-metrics `TaskMonitor` per candidate
+  (runtime-level metrics still need a `--cfg tokio_unstable` build and are
+  not wired), input generator (`scripts/bench/gen_input.py`)
+- [x] Harness scripts (`scripts/bench/`, incl. `setup_aws.sh` — **not
+  executed**: S3 bucket + IAM instance profile do not exist yet)
+- [ ] S3 bucket + IAM instance profile created (run `setup_aws.sh` once)
 - [ ] Tier-1 EC2 sweep → decision per §7
 
 ## 1. Questions to Answer
@@ -129,6 +137,50 @@ execute in milliseconds).
 - **Location**: `src/algo/sim.rs` (test-only module), scenarios as
   `#[ignore]`d tests run manually with
   `cargo test --bin dy sim_ -- --ignored --nocapture`
+
+## 2.6 Simulation Results (recorded 2026-07-05 — predictions, not verdicts)
+
+Run with `cargo test --bin dy sim_ -- --ignored --nocapture --test-threads=1`
+(scenarios in `src/algo/sim.rs`; seed 42; latency model 5–20ms base +
+1.5ms/WCU; channel capacities match the production pipeline; candidates all
+start at the target, i.e. no AIMD activity in phase 1).
+
+| Scenario (target) | A pool16 | A′ pool1 | B mpmc | C task |
+|---|---|---|---|---|
+| low-rate-mixed, 200 req, Σ580 (10/s) | 58.0s / 100% / tail 3.9s | identical | identical | identical |
+| mixed, 1000 req, Σ2634 (100/s) | 26.4s / 99.8% / 2.5s | identical | identical | 26.4s / 99.8% / 2.5s |
+| uniform-large, 300 req, Σ10387 (100/s) | 104.0s / 99.9% / 10.7s | identical | identical | identical |
+| uniform-small, 2000 req, Σ2000 (**1000/s**) | 7.0s / **28.5%** / 1.1s | 7.4s / 27.1% / 1.0s | 6.4s / 31.4% / 0.3s | **2.0s / 99.2%** / 0.2s |
+
+Interpretation (what phase 1 can and cannot say):
+
+- **Rate-bound regimes are architecture-insensitive under phase-1
+  assumptions.** With `actual == estimate` (feedback exact) and the client
+  target as the only ceiling, all four candidates sit at Σcost ÷ target with
+  identical tails. The hypothesized queue-depth hostage effect (Q3) and
+  split-bucket token waste (Q2) did **not** materialize — those need
+  estimation error / server-side variance (phase 2 with partial grants) or
+  real CPU effects to appear. Q2/Q3 remain open for the EC2 runs.
+- **The high-rate regime is dominated by ramp-up, and C wins it outright in
+  the simulation.** A/A′/B must discover the needed concurrency through
+  monitor-driven scale-out (doubling with wait periods); in a run whose ideal
+  time is 2s they only reach ~30% utilization before finishing. C has no
+  ramp: concurrency = rate × latency immediately, 99% utilization. Note this
+  *inverts* the hypothesis table's expectation for this regime — but the
+  hypothesis was based on per-request CPU overhead, which virtual time
+  cannot see. The EC2 run must check whether C's spawn/shared-bucket
+  contention costs eat its ramp-up advantage.
+- B consistently shows a smaller completion tail than A/A′ during ramp-up
+  (work-conserving queue), a weak signal in the direction of the Q3
+  hypothesis.
+- **Byproduct — real bug found by the simulation**: `Bucket::
+  estimate_available_at` returned the exact-remainder wait; near the token
+  boundary the matching f64 refill increment rounds to zero, so the waiter
+  loop (sleep remainder → refill → retry) stops progressing — a busy spin in
+  real time, a livelock under virtual time (it hung the mixed scenarios).
+  Fixed with a 1ms wait floor. Also, `Bucket::feedback` now clamps positive
+  refunds at `max_cap` (required for C's shared bucket; a serial per-worker
+  bucket could not overflow).
 
 ## 3. Workloads
 

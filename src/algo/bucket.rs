@@ -94,14 +94,23 @@ impl Bucket {
         when_debug!(self.inspect_internal_state());
     }
 
+    /// Lower bound of the wait suggested for an insufficient bucket. Near the
+    /// token boundary the exact-remainder wait becomes arbitrarily small and
+    /// the matching refill increment can round to zero in f64, so a waiter
+    /// repeating (sleep remainder → refill → retry) stops making progress: a
+    /// busy spin in real time and a livelock under paused virtual time. The
+    /// floor costs at most 1ms of extra pacing latency per wait, which is
+    /// negligible against the network calls this bucket paces.
+    const MIN_INSUFFICIENT_WAIT: Duration = Duration::from_millis(1);
+
     pub fn estimate_available_at(&self, amount: f64) -> Instant {
         if self.is_sufficient(amount) {
             Instant::now()
         } else {
-            Instant::now()
-                + Duration::from_secs_f64(
-                    (amount.min(self.max_cap) - self.cap) / self.refill_per_sec,
-                )
+            let wait = Duration::from_secs_f64(
+                (amount.min(self.max_cap) - self.cap) / self.refill_per_sec,
+            );
+            Instant::now() + wait.max(Self::MIN_INSUFFICIENT_WAIT)
         }
     }
 
@@ -148,6 +157,19 @@ impl Bucket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn test_insufficient_wait_has_a_floor() {
+        // Near the token boundary the exact-remainder wait can become
+        // arbitrarily small, and the matching refill increment then rounds
+        // to zero in f64: the waiter loops forever without progress (a
+        // livelock under virtual time, a busy spin in real time). The
+        // suggested wait must therefore never be shorter than a floor.
+        let bucket = Bucket::new(1.0, 1.0);
+        // cap = 0: the exact remainder wait for 1e-9 tokens would be ~1e-9s.
+        let at = bucket.estimate_available_at(1e-9);
+        assert!(at >= Instant::now() + Duration::from_millis(1));
+    }
 
     #[test]
     fn test_feedback_refund_is_clamped_at_max_cap() {
