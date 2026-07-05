@@ -147,6 +147,37 @@ if [ "$RUNNING_ON_EC2" = "1" ] && command -v systemd-run >/dev/null 2>&1; then
     fi
 fi
 
+# --- input cache ---------------------------------------------------------------
+# gen_input.py is deterministic in (mix, items, seed), so generated inputs are
+# cached in S3 under a content-addressed name and shared across instances AND
+# runs: regenerating the multi-GB quota inputs on every instance of every run
+# wastes minutes of fleet time each, and a download (~1 min for the largest
+# input, same region) is strictly faster. The cache also pins the exact input
+# bytes across runs — even a Python upgrade that changes RNG details cannot
+# silently alter the workload between two compared runs.
+S3_INPUT_CACHE="s3://$BUCKET/inputs"
+ensure_input() {  # ensure_input <mix> <items> <seed>; file lands at the shared path
+    local mix=$1 items=$2 seed=$3
+    local name="input-$mix-$items-$seed.jsonl"
+    local input="$WORK_DIR/$name"
+    [ -f "$input" ] && return 0
+    # Download via a temp name: an interrupted `aws s3 cp` leaves a partial
+    # file at the destination, which the -f check above would then trust.
+    if aws s3 cp "$S3_INPUT_CACHE/$name" "$input.part" --only-show-errors 2>/dev/null; then
+        mv "$input.part" "$input"
+        log "input cache hit: $name"
+        return 0
+    fi
+    rm -f "$input.part"
+    log "generating $name"
+    python3 "$SCRIPT_DIR/gen_input.py" \
+        --mix "$mix" --items "$items" --seed "$seed" --out "$input"
+    # Best-effort: later instances/runs skip generation. Failure is fine —
+    # the local file exists and the run proceeds.
+    aws s3 cp "$input" "$S3_INPUT_CACHE/$name" --only-show-errors 2>/dev/null \
+        || log "WARNING: input cache upload failed (continuing)"
+}
+
 # --- tool availability -------------------------------------------------------
 PERF_OK=0
 if command -v perf >/dev/null 2>&1 \
@@ -237,12 +268,10 @@ run_one() {
     aws dynamodb wait table-exists --region "$REGION" --table-name "$table"
 
     # 2. Input file (deterministic; same seed for all reps of a cell, so the
-    #    generated file is cached and reps run on identical input).
+    #    file is shared across reps and cached in S3 across instances/runs).
+    #    Normally a no-op: the pregen loop below already fetched everything.
     local input="$WORK_DIR/input-$mix-$items-$seed.jsonl"
-    if ! [ -f "$input" ]; then
-        python3 "$SCRIPT_DIR/gen_input.py" \
-            --mix "$mix" --items "$items" --seed "$seed" --out "$input"
-    fi
+    ensure_input "$mix" "$items" "$seed"
 
     # 3. Pseudo production workload, if the cell asks for it.
     local prod_pid=""
@@ -344,17 +373,12 @@ PYEOF
     fi
 }
 
-# Pre-generate every input before the first table exists: generation of the
-# multi-GB quota inputs takes minutes, and a provisioned high-WCU table
-# idling while an input is generated is pure billed waste.
+# Pre-fetch/generate every input before the first table exists: obtaining
+# the multi-GB quota inputs takes minutes, and a provisioned high-WCU table
+# idling while an input is prepared is pure billed waste.
 set_phase "-" "-" "pregen" ""
 while IFS=$'\t' read -r _cell_id _executor mix _wcu items _prod_rate _rep _budget seed; do
-    input="$WORK_DIR/input-$mix-$items-$seed.jsonl"
-    if ! [ -f "$input" ]; then
-        log "pre-generating $input"
-        python3 "$SCRIPT_DIR/gen_input.py" \
-            --mix "$mix" --items "$items" --seed "$seed" --out "$input"
-    fi
+    ensure_input "$mix" "$items" "$seed"
 done < "$CELL_LINES"
 
 while IFS=$'\t' read -r cell_id executor mix wcu items prod_rate rep budget seed; do

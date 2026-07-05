@@ -91,14 +91,17 @@ POLICY_DOC=$(cat <<EOF
       "Sid": "BenchArtifacts",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": "arn:aws:s3:::$BUCKET/runs/*"
+      "Resource": [
+        "arn:aws:s3:::$BUCKET/runs/*",
+        "arn:aws:s3:::$BUCKET/inputs/*"
+      ]
     },
     {
       "Sid": "BenchBucketList",
       "Effect": "Allow",
       "Action": ["s3:ListBucket"],
       "Resource": "arn:aws:s3:::$BUCKET",
-      "Condition": {"StringLike": {"s3:prefix": "runs/*"}}
+      "Condition": {"StringLike": {"s3:prefix": ["runs/*", "inputs/*"]}}
     }
   ]
 }

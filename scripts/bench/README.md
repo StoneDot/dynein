@@ -106,6 +106,15 @@ Notes:
 - **Seed** is per cell (not per rep): repetitions run on identical input, so
   they measure run-to-run variance, and multi-GB quota-scale inputs are
   generated once per cell.
+- **Input cache**: generated inputs are content-addressed
+  (`s3://<bucket>/inputs/input-<mix>-<items>-<seed>.jsonl`) and reused across
+  instances and runs — only the first instance ever to need an input
+  generates and uploads it; everyone else downloads (~1 min for the largest
+  input vs minutes of generation). This also pins the exact input bytes
+  across compared runs. Storage is ~86GB ≈ $2/month for the full Tier-1 set;
+  clear it with `aws s3 rm --recursive s3://<bucket>/inputs/` when the
+  benchmark season ends. (IAM: the instance role needs the `inputs/*`
+  statements added by the current `setup_aws.sh` — re-run it once.)
 - **Item counts** (plan §3): `items = ceil(WCU × 400 / avgWCU)` with
   avgWCU = 1 (uniform-small), 2.9 (mixed), 35 (uniform-large) — ≥ 400 s of
   steady state per cell.
