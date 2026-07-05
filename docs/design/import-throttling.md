@@ -1,7 +1,7 @@
 # Design Document: Throttled Import/Export Foundation for dynein
 
 - Status: Draft (design record for the wip branch `improve-export-import`)
-- Last updated: 2026-07-04
+- Last updated: 2026-07-05
 - Target branch: `improve-export-import` (source of truth: remote `my/improve-export-import`)
 - Related experimental branch: `improve-export-import-async-channel-queue` (8 parallel chunkers; benchmark not settled yet)
 
@@ -123,18 +123,65 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - **Direction**: cap the total number of items existing inside the pipeline with a semaphore. Acquire a permit on admission; release it when the item is finally resolved as successful or permanently failed. This keeps the resident population bounded **even with unbounded channels**, reconciling deadlock freedom (unbounded) with a memory cap (semaphore)
 - The retry path merely circulates while holding its permit, so it does not interfere with admission control
 
-### 5.3 Open design question: partitioned buckets vs a shared bucket
+### 5.3 Open performance questions: executor topology, partitioned vs shared buckets
 
-- With multi-table support, evenly-split per-worker buckets (§4.5) additionally require that the table mix flowing to each worker is uniform — a stronger assumption
-- Options: (a) keep the even split and absorb skew via feedback, (b) a shared bucket per table (accurate but contended), (c) per-table worker pools (gives up multi-table batching)
-- **Settle this with experiments.** Until then, have workers query a "capacity provider" abstraction so the design can fall either way
+These are **unverified performance hypotheses** that must be settled by
+measurement, not intuition. The detailed experiment design lives in
+`benchmark-plan.md`; this section records what is in question and why.
 
-### 5.4 Phase 3 benchmark plan (not executed yet)
+- **Task-per-request vs fixed worker pool**: the task-per-request model
+  (spawn one tokio task per BatchWriteItem request, bounded by a semaphore,
+  paced by a single shared bucket) was originally avoided on the assumption
+  of spawn overhead. That assumption is suspect: spawn costs ~µs against
+  5–50 ms network calls, and the model would delete the Signal channels,
+  round-robin distribution, and the entire scale-out machinery (concurrency
+  emerges from rate × latency; AIMD would just update the shared refill)
+- **Token waste of partitioned buckets** (hypothesis): with split per-worker
+  buckets, an idle worker's bucket saturates at max_cap and discards refill
+  while a busy worker starves — so under heterogeneous item sizes the
+  aggregate consumption falls below the target even though the average
+  "looks" capped by WCU. `feedback` corrects intra-worker estimation error
+  but cannot fix inter-worker imbalance. A shared bucket cannot lose tokens
+  this way. This is also why "the WCU cap makes topologies equivalent" is
+  only true for homogeneous workloads — benchmarks must include mixed item
+  sizes to have discriminating power
+- **Queue-depth skew**: per-worker queues are 16 batches deep; the
+  round-robin distributor skips full workers (so it is not blind), but it
+  cannot rebalance work already queued — expensive items hold up to 16×25
+  items hostage on one worker, visible as a completion tail. Depth 1 may
+  recover most of this within the pool model
+- **CPU affinity**: the pool model's presumed cache-affinity advantage is
+  likely illusory — workers are ordinary tokio tasks and migrate across
+  runtime threads (work stealing) unless pinned. Decide with measured CPU
+  time on the target instance families
+- **Multi-table extension** (kept from before): evenly-split buckets
+  additionally require the table mix per worker to be uniform. Options: (a)
+  even split + feedback, (b) shared bucket per table (contended), (c)
+  per-table pools (gives up multi-table batching). Note that if the
+  task-per-request model wins, (b) becomes the natural fit. Until settled,
+  have workers query a "capacity provider" abstraction so the design can
+  fall either way
 
-- Subject: single mpsc chunker (current) vs 8 parallel async-channel chunkers (`improve-export-import-async-channel-queue`)
-- Metrics: (1) effective throughput, (2) adherence of consumed WCU to the target (moving-window mean ± stddev = quantifying the "wobble"), (3) wasted requests (requests discarded due to throttling), (4) behavior at low WCU / high WCU / varied item sizes
-- **Run it after AIMD lands** (retry storms and wrong-direction scale-out would distort the results as noise)
-- Close the losing branch
+### 5.4 Phase 3 benchmark plan
+
+**See `benchmark-plan.md` for the full experiment design** (candidates,
+workload matrix, metrics, EC2/S3 disposable-fleet infrastructure, decision
+rules). Summary:
+
+- Candidates: A = current pool (queue 16), A′ = pool with queue depth 1,
+  C = task-per-request + shared bucket; B (shared MPMC queue + pool) held in
+  reserve. The chunker axis (single vs 8 parallel,
+  `improve-export-import-async-channel-queue`) is evaluated only if a pool
+  topology survives — the task model spawns from the chunker directly and
+  removes that axis
+- Metrics: throughput, WCU adherence (mean ± σ), token waste, completion
+  tail, wasted requests, CPU time / max RSS
+- Environment: disposable EC2 (m9g.xlarge / m8a.xlarge) bootstrapped via
+  user data, results persisted to S3, instances self-terminate — designed
+  for running many cells cheaply
+- **Run after AIMD** (done): retry storms and wrong-direction scale-out
+  would have distorted results as noise
+- Close the losing branch when Q5 is settled
 
 ## 6. Empirical Findings (2026-07-04)
 
@@ -151,7 +198,7 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 1. ~~Build the experiment environment, reproduce the stall, fix item accounting~~ (done)
 2. ~~Minimal AIMD (fast loop only) + progress deadline + effective-target-based scale-out decisions~~ (done; §4.6, §4.8)
 3. ~~CloudWatch slow control loop (informed recovery)~~ (done; §4.7)
-4. Settle the chunker architecture via benchmark (§5.4) ← next
+4. Settle the executor/chunker architecture via benchmark (§5.4, `benchmark-plan.md`) ← next
 5. Foundation generalization: resource vectorization (§5.1), move generic parts of `BatchWriteProcess` into algo, reduce `expect`s, scale-in
 6. Finish import: a `--max-wcu`-style CLI option (currently hardcoded to `100_000.0`), streaming file reads + semaphore admission control (§5.2)
 7. Parallel scan for export (RCU variant, separate branch)
