@@ -145,6 +145,19 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - **Verification**: on DynamoDB Local at a saturating target, candidate C
   self-tuned its cap to 4 and matched the pools' throughput without any
   manual cap (benchmark-plan.md §2.7.2)
+- **Design intent, clarified in review**: the two-layer structure of the
+  Monitor is deliberate and unchanged — each stat point is one windowed
+  rate estimate, and the mean/sample-σ over the stat-point series measure
+  the estimate and its dispersion. The fencepost fix only removes the
+  systematic error in each point's *value*; small-sample conservatism
+  still exists (few points → larger genuine σ). The old inflation was not
+  acceptable as "conservatism" because the effectiveness veto compares the
+  *recorded* previous-phase average against the current one and never
+  resets: a phase recorded with small-window inflation (e.g. a true 10/s
+  recorded as ~17.5/s) makes a genuine doubling look like no improvement,
+  permanently freezing scale-out. If explicit small-sample conservatism is
+  wanted later, add it transparently (e.g. a minimum stat-point count in
+  `should_grow`), not by biasing the estimator
 
 ## 5. Groundwork for Future Design (not implemented, but direction-setting)
 
