@@ -9,15 +9,20 @@ Implements the execution infrastructure of `docs/design/benchmark-plan.md`
 | File | Role | Runs on |
 |------|------|---------|
 | `setup_aws.sh` | One-time: S3 bucket `dynein-bench-<account-id>` + IAM role/instance profile `dynein-bench-instance` (least privilege, §5.1). Idempotent. Run only with user approval, then record the ARNs in `CLAUDE.local.md` | dev machine |
-| `launch.sh` | Orchestrator: renders `config.json` from the cell matrix, uploads it, launches the fleet. **Defaults to `--dry-run`; pass `--execute` to touch AWS** | dev machine |
-| `user_data.sh.tpl` | EC2 user-data template (`{{RUN_ID}}`, `{{SHARD}}`, `{{BUCKET}}`, `{{REGION}}`, `{{COMMIT_SHA}}`, `{{INSTANCE_TYPE}}`); installs tooling, obtains the `dy` binary, clones the repo at the pinned SHA, runs `run_cells.sh` | EC2 (rendered by launch.sh) |
-| `run_cells.sh` | Per-instance runner: table create → input gen → import under `/usr/bin/time -v` + perf + pidstat → `result.json` → S3 upload → table delete; EXIT trap cleans up and self-terminates | EC2 (or locally for testing) |
+| `preflight.sh` | **Gate G1** (postmortem): platform facts + capacity/cost arithmetic + rendered-template checks + watchdog self-test; must exit 0 before any `--execute`. `launch.sh --execute` runs it automatically | dev machine |
+| `launch.sh` | Orchestrator: renders `config.json` from the cell matrix, uploads it, launches the fleet. **Defaults to `--dry-run`; pass `--execute` to touch AWS.** `--canary` launches the G2 canary (1 instance, 2 cells); `--execute` refuses a full matrix without a canary PASS marker for the same commit | dev machine |
+| `canary_verify.sh` | **Gate G2**: verifies a canary run end-to-end (exit 0, budgets, flat max-RSS = streaming proof, tables deleted, instances terminated) and writes `s3://<bucket>/canary/<commit>/PASS` | dev machine |
+| `watchdog.sh` | Off-instance monitor **with abort authority**: CloudWatch stall detection, spend ceiling, heartbeat age, external cell deadlines. Abort = tables → SSM salvage → stop instances → report. Start it right after every `--execute` | dev machine |
+| `user_data.sh.tpl` | EC2 user-data template (`{{RUN_ID}}`, `{{SHARD}}`, `{{BUCKET}}`, `{{REGION}}`, `{{COMMIT_SHA}}`, `{{INSTANCE_TYPE}}`); installs tooling, obtains the `dy` binary, clones the repo at the pinned SHA, then hands off to the `dynein-bench-runner` systemd unit whose `OnFailure=` guardian unit cleans up even when the runner is SIGKILLed | EC2 (rendered by launch.sh) |
+| `run_cells.sh` | Per-instance runner: table create → input gen → import under `/usr/bin/time -v` + perf + pidstat, inside a `systemd-run` scope with `MemoryMax` (an OOM fails the rep, not the runner) → `result.json` → S3 upload → table delete; uploads a per-minute heartbeat; EXIT trap cleans up and self-terminates | EC2 (or locally for testing) |
+| `instance_cleanup.sh` | Guardian executed by the `OnFailure=` unit: deletes the run's tables, salvages artifacts/logs, shuts down — survives the runner's death | EC2 |
 | `gen_input.py` | Deterministic jsonl input generator for the §3 item mixes | both |
 | `collect.sh` | Downloads `runs/<run-id>/results/` from S3 | dev machine |
 | `analyze.py` | Parses the collected tree, prints the markdown comparison table (mean ± σ across reps) | dev machine |
 | `sweep.sh` | Lists/deletes leftover `dynein-bench-*` tables and tagged instances (list-only by default) | dev machine |
+| `tests/watchdog_test.sh` | Mock-AWS self-test of every watchdog abort branch (also run by preflight) | dev machine |
 
-## Flow
+## Flow (gates G0–G3, `benchmark-run-postmortem.md` §3)
 
 ```
 # 0. one time, with user approval (idempotent):
@@ -33,17 +38,27 @@ scripts/bench/launch.sh --bucket dynein-bench-<acct> --dry-run
 #    aws s3 cp target/prof/dy s3://<bucket>/runs/<run-id>/binaries/x86_64/dy
 #    (and an aarch64 cross-build under .../binaries/aarch64/dy)
 
-# 3. launch for real:
-scripts/bench/launch.sh --bucket dynein-bench-<acct> --run-id <id> --execute
+# 3. G2 canary: ONE instance, one w10 cell + one 1000-WCU mixed cell.
+#    (--execute auto-runs preflight = G1/G0.)
+scripts/bench/launch.sh --canary --execute --bucket <bucket> --region <r> \
+    --subnet-id <subnet> --security-group <sg>
+scripts/bench/watchdog.sh --run-id <canary-id> --bucket <bucket> \
+    --region <r> --budget-usd 5          # in a second terminal, immediately
 
-# 4. watch progress (no SSH; S3 object counts only):
-aws s3 ls --recursive s3://<bucket>/runs/<id>/results/ | wc -l
+# 4. verify the canary and write the PASS marker (gates the full launch):
+scripts/bench/canary_verify.sh --run-id <canary-id> --bucket <bucket> --region <r>
 
-# 5. collect + analyze:
+# 5. full launch (refuses without the canary PASS marker for this commit):
+scripts/bench/launch.sh --bucket <bucket> --run-id <id> --execute \
+    --region <r> --subnet-id <subnet> --security-group <sg>
+scripts/bench/watchdog.sh --run-id <id> --bucket <bucket> --region <r> \
+    --budget-usd <agreed ceiling>        # in a second terminal, immediately
+
+# 6. collect + analyze:
 scripts/bench/collect.sh <id> --bucket <bucket>
 python3 scripts/bench/analyze.py scripts/bench/out/<id>/results
 
-# 6. verify nothing leaked (tables cost money; instances too):
+# 7. verify nothing leaked (tables cost money; instances too):
 scripts/bench/sweep.sh            # list
 scripts/bench/sweep.sh --delete   # remove leftovers
 ```

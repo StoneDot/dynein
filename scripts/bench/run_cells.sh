@@ -65,6 +65,7 @@ cleanup() {
     local rc=$?
     set +e
     log "cleanup (exit code $rc)"
+    [ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null
     # Best-effort: delete any leftover tables of this run.
     local tables
     tables=$(aws dynamodb list-tables --region "$REGION" \
@@ -94,6 +95,56 @@ if [ "$RUNNING_ON_EC2" = "1" ]; then
     shutdown +"$HARD_SHUTDOWN_MINUTES" 2>/dev/null \
         || sudo shutdown +"$HARD_SHUTDOWN_MINUTES" 2>/dev/null \
         || log "WARNING: could not schedule hard shutdown guard"
+fi
+
+# --- heartbeat (postmortem §4.5: silence must differ from slow progress) ------
+# run_one keeps $WORK_DIR/phase.json updated with the current cell/rep/phase;
+# this loop stamps it with a timestamp and uploads it every minute. The
+# off-instance watchdog alarms on the heartbeat's age, so a wedged or dead
+# runner becomes visible within minutes even when S3 result counts look
+# plausible.
+HEARTBEAT_OBJ="s3://$BUCKET/runs/$RUN_ID/heartbeat/$INSTANCE_TYPE-s$SHARD.json"
+set_phase() {
+    printf '{"cell":"%s","rep":"%s","phase":"%s","cell_started":%s}\n' \
+        "$1" "$2" "$3" "${4:-null}" > "$WORK_DIR/phase.json"
+}
+set_phase "-" "-" "boot" ""
+heartbeat_loop() {
+    while true; do
+        python3 - "$WORK_DIR/phase.json" <<'PYEOF' > "$WORK_DIR/heartbeat.json" 2>/dev/null
+import json, sys, time
+try:
+    body = json.load(open(sys.argv[1]))
+except Exception:
+    body = {"phase": "unknown"}
+body["ts"] = int(time.time())
+print(json.dumps(body))
+PYEOF
+        aws s3 cp "$WORK_DIR/heartbeat.json" "$HEARTBEAT_OBJ" >/dev/null 2>&1 || true
+        sleep 60
+    done
+}
+heartbeat_loop &
+HEARTBEAT_PID=$!
+
+# --- memory isolation (postmortem §4.4) ----------------------------------------
+# The measured dy process runs in its own systemd scope with a MemoryMax a
+# few GB below the instance RAM: a runaway import is then OOM-killed inside
+# the scope (recorded as a failed rep; the runner continues) instead of the
+# kernel picking a victim in the runner's cgroup and taking the guardian
+# down with the workload — which is how run 090552 left a 39k table idling.
+MEMORY_SCOPE_OK=0
+if [ "$RUNNING_ON_EC2" = "1" ] && command -v systemd-run >/dev/null 2>&1; then
+    mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    # Leave 4GB for the OS, the runner and the AWS CLI.
+    DY_MEMORY_MAX_KB=$((mem_total_kb - 4 * 1024 * 1024))
+    if [ "$DY_MEMORY_MAX_KB" -gt $((2 * 1024 * 1024)) ] \
+        && systemd-run --scope --quiet -p MemoryMax=1G -- true >/dev/null 2>&1; then
+        MEMORY_SCOPE_OK=1
+        log "dy runs under systemd scope MemoryMax=$((DY_MEMORY_MAX_KB / 1024 / 1024))G"
+    else
+        log "WARNING: systemd-run scope unavailable; dy runs unisolated"
+    fi
 fi
 
 # --- tool availability -------------------------------------------------------
@@ -150,8 +201,11 @@ run_one() {
     local cell_id=$1 executor=$2 mix=$3 wcu=$4 items=$5 prod_rate=$6 rep=$7 budget=$8 seed=$9
     local table="dynein-bench-${RUN_ID}-${cell_id}-${rep}"
     local dir="$WORK_DIR/artifacts/$cell_id/rep$rep"
+    local cell_started
+    cell_started=$(date +%s)
     mkdir -p "$dir"
     log "=== cell=$cell_id rep=$rep executor=$executor mix=$mix wcu=$wcu items=$items budget=${budget}s table=$table"
+    set_phase "$cell_id" "$rep" "create-table" "$cell_started"
 
     # 1. Table. Expensive tables are reused across cells (billing note in
     #    the header); cheap ones are fresh per rep. Quota-scale cells from
@@ -217,7 +271,12 @@ env DYNEIN_BENCH_STATS='$dir/stats.jsonl' DYNEIN_BENCH_EXECUTOR='$executor' RUST
     if [ "$PERF_OK" = "1" ]; then
         inner="perf record -F 99 -g -o '$dir/perf.data' -- $inner"
     fi
+    if [ "$MEMORY_SCOPE_OK" = "1" ]; then
+        # Own scope: a memory blowup OOM-kills this rep, not the runner.
+        inner="systemd-run --scope --quiet -p MemoryMax=${DY_MEMORY_MAX_KB}K -- $inner"
+    fi
 
+    set_phase "$cell_id" "$rep" "import" "$cell_started"
     local started ended rc=0
     started=$(date +%s)
     printf 'y\n' | timeout --kill-after=30 "$((budget * 2))" \
@@ -277,6 +336,7 @@ PYEOF
     # 6. Upload artifacts, then drop the table. Reused tables stay for the
     #    following cells and are removed by the exit cleanup (deleting and
     #    recreating them would multiply the billed table-hours).
+    set_phase "$cell_id" "$rep" "upload" "$cell_started"
     aws s3 cp --recursive "$dir" "$S3_PREFIX/$cell_id/rep$rep/" >/dev/null
     if [ "$reuse" = "0" ]; then
         aws dynamodb delete-table --region "$REGION" --table-name "$table" >/dev/null
@@ -287,6 +347,7 @@ PYEOF
 # Pre-generate every input before the first table exists: generation of the
 # multi-GB quota inputs takes minutes, and a provisioned high-WCU table
 # idling while an input is generated is pure billed waste.
+set_phase "-" "-" "pregen" ""
 while IFS=$'\t' read -r _cell_id _executor mix _wcu items _prod_rate _rep _budget seed; do
     input="$WORK_DIR/input-$mix-$items-$seed.jsonl"
     if ! [ -f "$input" ]; then
@@ -302,6 +363,7 @@ while IFS=$'\t' read -r cell_id executor mix wcu items prod_rate rep budget seed
 done < "$CELL_LINES"
 
 # Instance-level summary marker (progress is observed via S3 object counts).
+set_phase "-" "-" "done" ""
 date -u +%FT%TZ > "$WORK_DIR/artifacts/shard-$SHARD.done"
 aws s3 cp "$WORK_DIR/artifacts/shard-$SHARD.done" "$S3_PREFIX/shard-$SHARD.done" >/dev/null
 log "shard $SHARD complete"

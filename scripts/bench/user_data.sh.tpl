@@ -5,9 +5,12 @@
 #
 # Flow: install tooling -> obtain the dy binary (prebuilt from S3 preferred,
 # on-instance cargo build as fallback) -> clone the repo at the pinned commit
-# -> download config.json -> run run_cells.sh (which self-terminates the
-# instance via its EXIT trap; the instance is launched with
-# --instance-initiated-shutdown-behavior terminate).
+# -> download config.json -> hand off to the dynein-bench-runner systemd
+# unit. The runner unit carries OnFailure=dynein-bench-cleanup.service
+# (postmortem §4.4): if the runner dies in a way that skips its EXIT trap
+# (OOM SIGKILL took both the workload and the trap down in run 090552), an
+# independent, memory-capped guardian unit deletes the run's tables,
+# salvages artifacts and shuts the instance down.
 
 set -euxo pipefail
 exec > /var/log/dynein-bench.log 2>&1
@@ -24,7 +27,7 @@ REGION="{{REGION}}"
 COMMIT_SHA="{{COMMIT_SHA}}"
 INSTANCE_TYPE="{{INSTANCE_TYPE}}"
 
-# Absolute last-resort guard in case run_cells.sh never starts.
+# Absolute last-resort guard in case the runner unit never starts.
 shutdown +540 "dynein-bench boot-level hard guard"
 
 # --- tooling (Amazon Linux 2023) ---------------------------------------------
@@ -59,14 +62,48 @@ else
 fi
 "$DY_BIN" --version
 
-# --- config + run -------------------------------------------------------------
+# --- config -------------------------------------------------------------------
 aws s3 cp "s3://$BUCKET/runs/$RUN_ID/config.json" "$WORK/config.json"
 
-export DY_BIN INSTANCE_TYPE
-export RUNNING_ON_EC2=1
-export WORK_DIR="$WORK/work"
-bash "$WORK/repo/scripts/bench/run_cells.sh" "$WORK/config.json" "$SHARD"
+# --- runner + guardian units (postmortem §4.4) --------------------------------
+cat > "$WORK/env" <<ENVEOF
+RUN_ID=$RUN_ID
+SHARD=$SHARD
+BUCKET=$BUCKET
+REGION=$REGION
+INSTANCE_TYPE=$INSTANCE_TYPE
+DY_BIN=$DY_BIN
+RUNNING_ON_EC2=1
+WORK_DIR=$WORK/work
+HOME=/root
+ENVEOF
 
-# run_cells.sh's EXIT trap already shuts the instance down; this is belt and
-# braces in case the trap is ever removed.
-shutdown -h now
+cat > /etc/systemd/system/dynein-bench-cleanup.service <<UNITEOF
+[Unit]
+Description=dynein bench guardian cleanup (tables, salvage, shutdown)
+
+[Service]
+Type=oneshot
+EnvironmentFile=$WORK/env
+# The guardian must survive memory pressure that killed the runner.
+MemoryMax=256M
+ExecStart=/usr/bin/bash $WORK/repo/scripts/bench/instance_cleanup.sh
+UNITEOF
+
+cat > /etc/systemd/system/dynein-bench-runner.service <<UNITEOF
+[Unit]
+Description=dynein bench cell runner (run $RUN_ID shard $SHARD)
+OnFailure=dynein-bench-cleanup.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=$WORK/env
+ExecStart=/usr/bin/bash $WORK/repo/scripts/bench/run_cells.sh $WORK/config.json $SHARD
+UNITEOF
+
+systemctl daemon-reload
+# --no-block: the runner runs for hours; cloud-init must not wait on it.
+# On success run_cells.sh's EXIT trap shuts the instance down; on unit
+# failure the OnFailure guardian does.
+systemctl start --no-block dynein-bench-runner.service
+echo "runner unit started; boot script done"

@@ -91,23 +91,29 @@ def check(ok, msg):
     if not ok: fail = 1
 
 AVG_BYTES = {"uniform-small": 110, "mixed": 2099, "uniform-large": 35000}
-# The importer currently holds the whole file plus its deserialized form in
-# memory; 2.5x file size is the guard factor (measured: 8.5GB file -> 15.6GB
-# RSS). Revisit after streaming reads land (import-throttling.md roadmap 6).
-MEM_FACTOR = 2.5
+# Streaming reads + admission control (import-throttling.md §4.11) bound the
+# importer's resident set by the admission cap, not the input size: at most
+# ADMISSION_ITEM_CAP items live in the pipeline at once. The old whole-file
+# rule (input x 2.5 < RAM, which OOM-killed run 090552) is replaced by the
+# cap-derived bound with a 3x safety factor; the canary independently
+# verifies flat RSS on the real platform (canary_verify.sh --max-rss-mb).
+ADMISSION_ITEM_CAP = 10_000  # keep in sync with src/transfer.rs
+MEM_OVERHEAD = 1e9           # runtime + buffers, generous
 
 inputs = {}
 max_wcu_by_shard = {}
+max_item_bytes = 0
 for c in cfg["cells"]:
     size = c["items"] * AVG_BYTES[c["mix"]]
     inputs[(c["mix"], c["items"], c.get("seed"))] = size
+    max_item_bytes = max(max_item_bytes, AVG_BYTES[c["mix"]])
     key = c.get("shard", 0)
     max_wcu_by_shard[key] = max(max_wcu_by_shard.get(key, 0), c["wcu"])
 
-biggest = max(inputs.values()) if inputs else 0
-check(biggest * MEM_FACTOR < ram_gb * 1e9,
-      f"largest input {biggest/1e9:.1f}GB x {MEM_FACTOR} fits in {ram_gb:.0f}GB RAM "
-      f"(need {biggest*MEM_FACTOR/1e9:.1f}GB)")
+resident = ADMISSION_ITEM_CAP * max_item_bytes * 3 + MEM_OVERHEAD
+check(resident < ram_gb * 1e9,
+      f"streaming resident bound {resident/1e9:.1f}GB "
+      f"({ADMISSION_ITEM_CAP} items x {max_item_bytes}B x3 + overhead) fits {ram_gb:.0f}GB RAM")
 
 total_inputs = sum(inputs.values())
 check(total_inputs + 10e9 < root_gb * 1e9,
@@ -152,9 +158,19 @@ else
     fail "no rendered user-data found next to $CONFIG (run launch.sh --dry-run first)"
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-for f in "$SCRIPT_DIR"/run_cells.sh "$SCRIPT_DIR"/launch.sh; do
+for f in "$SCRIPT_DIR"/run_cells.sh "$SCRIPT_DIR"/launch.sh \
+         "$SCRIPT_DIR"/watchdog.sh "$SCRIPT_DIR"/canary_verify.sh \
+         "$SCRIPT_DIR"/instance_cleanup.sh; do
     bash -n "$f" && pass "bash -n $f" || fail "bash -n failed: $f"
 done
+
+# The watchdog is part of the run's safety case: its abort logic must pass
+# its mock-driven self-test before any launch relies on it.
+if "$SCRIPT_DIR"/tests/watchdog_test.sh >/dev/null 2>&1; then
+    pass "watchdog self-test (mocked abort/budget/deadline paths)"
+else
+    fail "watchdog self-test failed — run scripts/bench/tests/watchdog_test.sh"
+fi
 
 echo
 if [ "$FAIL" = "0" ]; then

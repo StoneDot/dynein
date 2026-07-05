@@ -1,6 +1,17 @@
 # Postmortem: Tier-1 Benchmark Run Attempts (2026-07-05)
 
 - Status: Final
+- **Implementation status (2026-07-05, same day)**: every gate and monitor
+  prescribed below now exists and is mechanically enforced —
+  G1 `preflight.sh` (auto-run by `launch.sh --execute`, includes the
+  watchdog self-test), G2 `launch.sh --canary` + `canary_verify.sh`
+  (PASS marker required for a full `--execute`; canary asserts flat max-RSS
+  now that streaming reads landed), §4 `watchdog.sh` (stall / spend ceiling /
+  heartbeat age / external cell deadlines, abort authority verified by
+  mock-driven self-tests in `scripts/bench/tests/`), §4.4 `systemd-run`
+  MemoryMax scope per rep + `OnFailure=` guardian unit
+  (`instance_cleanup.sh`), §4.5 per-minute heartbeats. The canary itself has
+  not been run yet (it is the next billed step)
 - Scope: the *process* failures of the four EC2 launch attempts
   (runs 084300, 085028, 090224, 090552), not the product OOM bug they
   surfaced (that finding lives in `import-throttling.md` §6)
