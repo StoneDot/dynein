@@ -51,8 +51,9 @@ pub enum ExecutorKind {
     Pool { queue_depth: usize },
     /// Shared MPMC process queue, fixed workers pulling from it (B).
     Mpmc,
-    /// One tokio task per request, shared bucket (C).
-    Task,
+    /// One tokio task per request, shared bucket (C). `max_in_flight`
+    /// overrides the in-flight request cap (`None` = the candidate default).
+    Task { max_in_flight: Option<usize> },
 }
 
 impl ExecutorKind {
@@ -61,17 +62,30 @@ impl ExecutorKind {
         ExecutorKind::Pool { queue_depth: 16 }
     }
 
-    /// Parses a candidate name: `pool<N>` / `mpmc` / `task`.
+    /// Parses a candidate name: `pool<N>` / `mpmc` / `task[<N>]`.
     pub fn parse(s: &str) -> Option<ExecutorKind> {
+        fn positive(s: &str) -> Option<usize> {
+            let n: usize = s.parse().ok()?;
+            if n == 0 {
+                None
+            } else {
+                Some(n)
+            }
+        }
         match s {
             "mpmc" => Some(ExecutorKind::Mpmc),
-            "task" => Some(ExecutorKind::Task),
+            "task" => Some(ExecutorKind::Task {
+                max_in_flight: None,
+            }),
             _ => {
-                let depth: usize = s.strip_prefix("pool")?.parse().ok()?;
-                if depth == 0 {
-                    return None;
+                if let Some(rest) = s.strip_prefix("task") {
+                    return Some(ExecutorKind::Task {
+                        max_in_flight: Some(positive(rest)?),
+                    });
                 }
-                Some(ExecutorKind::Pool { queue_depth: depth })
+                Some(ExecutorKind::Pool {
+                    queue_depth: positive(s.strip_prefix("pool")?)?,
+                })
             }
         }
     }
@@ -121,9 +135,12 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> AnyExecutor<
             ExecutorKind::Mpmc => {
                 AnyExecutor::Mpmc(MpmcExecutor::new(recv, target_limit, initial_target))
             }
-            ExecutorKind::Task => {
-                AnyExecutor::Task(TaskExecutor::new(recv, target_limit, initial_target))
-            }
+            ExecutorKind::Task { max_in_flight } => AnyExecutor::Task(match max_in_flight {
+                None => TaskExecutor::new(recv, target_limit, initial_target),
+                Some(cap) => {
+                    TaskExecutor::with_max_concurrency(recv, target_limit, initial_target, cap)
+                }
+            }),
         }
     }
 
@@ -186,7 +203,9 @@ mod tests {
             ExecutorKind::Pool { queue_depth: 16 },
             ExecutorKind::Pool { queue_depth: 1 },
             ExecutorKind::Mpmc,
-            ExecutorKind::Task,
+            ExecutorKind::Task {
+                max_in_flight: None,
+            },
         ] {
             let recorder = SimRecorder::new();
             let (tx, rx) = channel(16);
@@ -232,7 +251,19 @@ mod tests {
     #[test]
     fn test_parse_mpmc_and_task() {
         assert_eq!(ExecutorKind::parse("mpmc"), Some(ExecutorKind::Mpmc));
-        assert_eq!(ExecutorKind::parse("task"), Some(ExecutorKind::Task));
+        assert_eq!(
+            ExecutorKind::parse("task"),
+            Some(ExecutorKind::Task {
+                max_in_flight: None
+            })
+        );
+        // task<N> overrides the in-flight request cap (a benchmark axis).
+        assert_eq!(
+            ExecutorKind::parse("task64"),
+            Some(ExecutorKind::Task {
+                max_in_flight: Some(64)
+            })
+        );
     }
 
     #[test]
@@ -243,6 +274,8 @@ mod tests {
         assert_eq!(ExecutorKind::parse("pool0"), None);
         assert_eq!(ExecutorKind::parse("pool-1"), None);
         assert_eq!(ExecutorKind::parse("POOL16"), None);
+        assert_eq!(ExecutorKind::parse("task0"), None);
+        assert_eq!(ExecutorKind::parse("task-1"), None);
     }
 
     #[test]

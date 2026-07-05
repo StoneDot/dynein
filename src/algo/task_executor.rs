@@ -27,15 +27,24 @@
 use crate::algo::bucket::Bucket;
 use crate::algo::congestion::{AimdController, BoostSlot, CongestionStats, TargetGauge};
 use crate::algo::executor::ExecutorError;
-use crate::algo::worker::{
-    ResourceConstraintProcess, DEFAULT_MAX_CONCURRENT_CONNECTION, MINIMUM_WORKER_TARGET_LIMIT,
-};
+use crate::algo::worker::{ResourceConstraintProcess, MINIMUM_WORKER_TARGET_LIMIT};
 use log::info;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
+
+/// Default bound on in-flight request tasks. The concurrency this
+/// architecture actually needs emerges from rate × latency: even a
+/// quota-scale target (40k WCU/s in 25-WCU batches at ~30ms) keeps only
+/// ~50 requests in flight. The cap exists for the pathological case where
+/// the server saturates *without* throttling (latency inflates instead):
+/// unbounded admission then piles requests onto an already saturated
+/// server (observed on DynamoDB Local, benchmark-plan.md §2.7). On real
+/// DynamoDB saturation surfaces as throttling and AIMD lowers the token
+/// rate, so this cap is a backstop, not the governor.
+pub(crate) const DEFAULT_TASK_MAX_IN_FLIGHT: usize = 256;
 
 pub struct TaskExecutor<T: ResourceConstraintProcess + Clone> {
     /// This channel gets a task to proceed with resource constraint
@@ -63,8 +72,7 @@ pub struct TaskExecutor<T: ResourceConstraintProcess + Clone> {
 }
 
 impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> TaskExecutor<T> {
-    /// Creates a task-per-request executor. Parameters mirror
-    /// [`crate::algo::worker::ThrottledExecutor::new`].
+    /// Creates a task-per-request executor with the default in-flight cap.
     pub fn new(
         recv: Receiver<T>,
         target_limit: f64,
@@ -74,7 +82,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> TaskExecutor
             recv,
             target_limit,
             initial_target,
-            DEFAULT_MAX_CONCURRENT_CONNECTION,
+            DEFAULT_TASK_MAX_IN_FLIGHT,
         )
     }
 

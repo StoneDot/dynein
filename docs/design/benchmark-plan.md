@@ -248,6 +248,60 @@ saturates at ~8.4k items/s, i.e. an unreachable target**:
   per-process temporary credentials made tables "vanish" between
   invocations until static dummy credentials were exported
 
+### 2.7.1 Brush-up after the structural review (2026-07-05, same day)
+
+The review concluded C's collapse was **implementation-level, not
+architectural**, and two fixes were applied:
+
+1. **Chunker full-batch fill** (`fill_to_capacity` in transfer.rs): the
+   chunker now keeps reading until the batch holds 25 items or the producer
+   closes, instead of sending whatever one `recv_many` returned. This fixes
+   the pre-existing partial-chunk inefficiency (§6 finding of 2026-07-04)
+   for *all* candidates; C merely amplified it maximally because it has no
+   queue backpressure. Waiting costs nothing: the token bucket paces
+   requests downstream anyway
+2. **C's in-flight cap decoupled from the pool constant**: the semaphore
+   default was the pool's `DEFAULT_MAX_CONCURRENT_CONNECTION` (1024); it is
+   now `DEFAULT_TASK_MAX_IN_FLIGHT = 256`, and `task<N>` (e.g. `task64`)
+   overrides it at runtime as a benchmark axis. Context: the pool has an
+   implicit concurrency governor (the scale-out effectiveness check stopped
+   it at 16 workers); C's only governor is AIMD, which never fires when a
+   server saturates *silently* (no throttles) — real DynamoDB throttles
+   instead, so the cap is a backstop against bufferbloat, not the governor
+
+Post-fix numbers (same cells; v1 = §2.7 table above):
+
+| candidate | wall | items/s | user/sys CPU | requests (items/req) |
+|---|---|---|---|---|
+| A pool16 | 48.0s | 8,326 | 8.2s / 1.0s | 16,000 (25.0) |
+| A′ pool1 | 48.6s | 8,228 | 6.9s / 1.1s | 16,000 (25.0) |
+| B mpmc | 47.5s | 8,417 | 5.2s / 1.0s | 16,000 (25.0) |
+| C task (256) | 52.9s | 7,565 | 7.7s / 1.8s | 16,096 (24.9) |
+| C task32 | 47.9s | **8,345** | **5.7s** / 1.1s | 16,000 (25.0) |
+| C task64 | 49.0s | 8,159 | 6.4s / 1.2s | 16,000 (25.0) |
+
+- C recovered from −42% to −10% with the two fixes at the default cap, and
+  **ties the best candidate (B) at in-flight 32** with comparable CPU. The
+  local optimum (32) sits near the single-node server's saturation point;
+  on real DynamoDB the needed in-flight at quota scale is ~50 (rate ×
+  latency), so **the EC2 Tier-1 C cells should sweep the in-flight axis
+  (e.g. task64 / task256)** rather than assume one value
+- Cell 1 (reachable target) after the fix: all four exactly 4,800 requests
+  (25.0 items/request) — the chunker fix also removed the small partial-
+  batch tail everyone had
+- Reviewed but deliberately **not** changed (recorded for the EC2 phase):
+  (a) A/B rate-update signals can stall behind a worker's long bucket wait
+  (A: in-band behind ≤16 queued batches; B: blocking ctrl channel while the
+  worker waits for tokens) — a shared property of the pool design; A is the
+  incumbent baseline and B mirrors its semantics on purpose, so fixing it
+  would muddy attribution. Candidate C is structurally immune (single
+  pacing point, no per-worker channels); (b) C consumes bucket tokens
+  before acquiring the semaphore permit — during a permit stall tokens are
+  held by an already-admitted request; burst is bounded by `max_cap`, same
+  as the pool's per-worker behavior; (c) request-task panics in C drop the
+  permit and lose the item, converging to the stall deadline — the same
+  failure mode and safety net as a pool worker panic
+
 ## 3. Workloads
 
 Discriminating power matters: with uniform items and ample WCU, *all*

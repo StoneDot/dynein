@@ -164,7 +164,12 @@ mod scenarios {
         ("A  pool16", ExecutorKind::Pool { queue_depth: 16 }),
         ("A' pool1", ExecutorKind::Pool { queue_depth: 1 }),
         ("B  mpmc", ExecutorKind::Mpmc),
-        ("C  task", ExecutorKind::Task),
+        (
+            "C  task",
+            ExecutorKind::Task {
+                max_in_flight: None,
+            },
+        ),
     ];
 
     /// Latency model: a 5–20ms base (connection/server time) plus a

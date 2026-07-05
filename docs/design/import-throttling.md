@@ -107,6 +107,22 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - On abort, workers may still hold in-flight retries whose receiver is gone; those sends now log-and-drop instead of panicking (correct because the import is reporting an error anyway)
 - `StallDetector` is pure logic with injected time (unit-tested)
 
+### 4.9 Chunker waits for full batches (`fill_to_capacity`)
+
+- **Decision**: the chunker keeps reading the producer channel until the
+  batch holds 25 items or the producer closes, instead of sending whatever
+  a single `recv_many` returned. Retries are still drained first at every
+  iteration, and a partial final batch is sent when the producer is done
+- **Rationale**: an executor that consumes faster than the producer feeds
+  turns every `recv_many` remainder into a partial BatchWriteItem request
+  (the 2026-07-04 finding; measured at 21.4 items/request with the
+  task-per-request candidate on DynamoDB Local). Waiting costs nothing
+  downstream because the token bucket paces requests anyway, and fuller
+  batches mean strictly fewer requests for the same items
+- **Interaction with the invariants**: termination and accounting are
+  untouched — the fill only blocks while the producer channel is open, and
+  the producer always closes it after queueing all input (§3 still holds)
+
 ## 5. Groundwork for Future Design (not implemented, but direction-setting)
 
 ### 5.1 Multi-table / GSI support: vectorizing the resource

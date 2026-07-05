@@ -1002,6 +1002,30 @@ async fn stream_write_of_jsons_with_chunked(
     stream_writes_with_chucked(cx, iter.into_iter(), max_wcu, hints).await
 }
 
+/// Fills `items` up to `capacity` from the producer channel, waiting for
+/// more input as long as the producer is alive. Returns `false` once the
+/// producer has closed the channel.
+///
+/// Waiting for a full batch matters: an executor that consumes faster than
+/// the producer feeds (e.g. the task-per-request candidate with ample
+/// tokens) would otherwise turn every `recv_many` remainder into a partial
+/// BatchWriteItem request — measured as 21.4 items/request and +17%
+/// requests on DynamoDB Local (benchmark-plan.md §2.7). Waiting costs
+/// nothing downstream because the token bucket paces requests anyway.
+/// Cancel-safe: items received before cancellation stay in `items`.
+async fn fill_to_capacity(
+    rx: &mut tokio::sync::mpsc::Receiver<WriteRequest>,
+    items: &mut Vec<WriteRequest>,
+    capacity: usize,
+) -> bool {
+    while items.len() < capacity {
+        if rx.recv_many(items, capacity - items.len()).await == 0 {
+            return false;
+        }
+    }
+    true
+}
+
 async fn stream_writes_with_chucked(
     cx: &app::Context,
     iter: impl Iterator<Item = WriteRequest>,
@@ -1182,14 +1206,14 @@ async fn stream_writes_with_chucked(
             }
 
             if items.len() < 25 && producer_open {
-                // Try to fill the rest of the batch with items that are read from files
-                let num_available_space = 25 - items.len();
+                // Fill the rest of the batch with items that are read from
+                // files, waiting until the batch is full (or the producer is
+                // done) so that a fast executor cannot force partial batches.
                 select! {
-                    n = rx.recv_many(&mut items, num_available_space) => {
-                        if n == 0 {
-                            // The producer has queued all input items and dropped the sender.
-                            producer_open = false;
-                        }
+                    open = fill_to_capacity(&mut rx, &mut items, 25) => {
+                        // false: the producer has queued all input items and
+                        // dropped the sender.
+                        producer_open = open;
                     }
                     _ = terminate_rx.changed() => {
                         // This cancel is safe because a termination signal would send after all items were processed.
@@ -1541,6 +1565,44 @@ mod tests {
         assert_eq!(summary.successful_items, 0);
         assert_eq!(summary.failed_items, 2);
         assert!(summary.retry_requests.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_fill_to_capacity_waits_for_a_full_batch() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteRequest>(64);
+        let mut items = Vec::new();
+
+        // 10 items available now, 20 more arriving later: the fill must wait
+        // for the producer instead of returning a partial batch.
+        for i in 0..10 {
+            tx.send(put_req(&format!("now{}", i))).await.unwrap();
+        }
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for i in 0..20 {
+                tx.send(put_req(&format!("later{}", i))).await.unwrap();
+            }
+            tx // keep the channel open
+        });
+
+        let open = fill_to_capacity(&mut rx, &mut items, 25).await;
+        assert!(open);
+        assert_eq!(items.len(), 25);
+
+        // The producer closes with 5 items left: the fill returns the rest
+        // as a partial batch and reports the closed channel.
+        let tx = sender.await.unwrap();
+        drop(tx);
+        let mut rest = Vec::new();
+        let open = fill_to_capacity(&mut rx, &mut rest, 25).await;
+        assert!(!open);
+        assert_eq!(rest.len(), 5);
+
+        // A closed, drained channel keeps reporting closed without items.
+        let mut empty = Vec::new();
+        let open = fill_to_capacity(&mut rx, &mut empty, 25).await;
+        assert!(!open);
+        assert!(empty.is_empty());
     }
 
     #[test]
