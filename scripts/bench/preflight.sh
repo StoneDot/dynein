@@ -79,6 +79,46 @@ aws iam list-attached-role-policies --role-name "$IAM_PROFILE" \
     && pass "SSM Session Manager policy attached (rescue path)" \
     || fail "AmazonSSMManagedInstanceCore not attached to $IAM_PROFILE"
 
+# The role must be allowed to act in the TARGET region, not just in whatever
+# region the policy template happened to be rendered for: the 2026-07-05
+# canary stalled 15 minutes in a create-table retry loop because a
+# setup_aws.sh re-run had silently narrowed the DynamoDB resource ARN back
+# to ap-northeast-1 while the fleet ran in us-west-2. The IAM policy
+# simulator cannot be used here (member accounts of an Organization get a
+# spurious implicitDeny because SCPs are invisible to them), so parse the
+# actual inline policy document and check its region segments directly.
+if aws iam get-role-policy --role-name "$IAM_PROFILE" \
+    --policy-name dynein-bench-policy --output json \
+    > /tmp/dynein-preflight-policy.$$ 2>/dev/null; then
+    python3 - /tmp/dynein-preflight-policy.$$ "$REGION" <<'PYEOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))["PolicyDocument"]
+region = sys.argv[2]
+ok = False
+for st in doc.get("Statement", []):
+    if st.get("Effect") != "Allow":
+        continue
+    actions = st.get("Action", [])
+    actions = [actions] if isinstance(actions, str) else actions
+    if not any(a in ("dynamodb:CreateTable", "dynamodb:*") for a in actions):
+        continue
+    resources = st.get("Resource", [])
+    resources = [resources] if isinstance(resources, str) else resources
+    for r in resources:
+        parts = r.split(":")
+        if len(parts) > 3 and parts[3] in ("*", region):
+            ok = True
+print(("PASS  " if ok else "FAIL  ")
+      + f"role's DynamoDB resource ARN covers region {region}"
+      + ("" if ok else " (setup_aws.sh re-run may have narrowed it — the 2026-07-05 canary stall)"))
+sys.exit(0 if ok else 1)
+PYEOF
+    [ $? -ne 0 ] && FAIL=1
+    rm -f /tmp/dynein-preflight-policy.$$
+else
+    fail "could not read inline policy dynein-bench-policy from role $IAM_PROFILE"
+fi
+
 # --- config-derived capacity arithmetic (postmortem G0) ------------------------
 python3 - "$CONFIG" "$RAM_GB" "$ROOT_GB" "$BUDGET_USD" <<'PYEOF'
 import json, sys

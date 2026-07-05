@@ -73,7 +73,7 @@ POLICY_DOC=$(cat <<EOF
         "dynamodb:Scan",
         "dynamodb:TagResource"
       ],
-      "Resource": "arn:aws:dynamodb:$REGION:$ACCOUNT_ID:table/dynein-bench-*"
+      "Resource": "arn:aws:dynamodb:*:$ACCOUNT_ID:table/dynein-bench-*"
     },
     {
       "Sid": "ListTablesForCleanup",
