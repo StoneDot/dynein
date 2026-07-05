@@ -284,6 +284,18 @@ PYEOF
     fi
 }
 
+# Pre-generate every input before the first table exists: generation of the
+# multi-GB quota inputs takes minutes, and a provisioned high-WCU table
+# idling while an input is generated is pure billed waste.
+while IFS=$'\t' read -r _cell_id _executor mix _wcu items _prod_rate _rep _budget seed; do
+    input="$WORK_DIR/input-$mix-$items-$seed.jsonl"
+    if ! [ -f "$input" ]; then
+        log "pre-generating $input"
+        python3 "$SCRIPT_DIR/gen_input.py" \
+            --mix "$mix" --items "$items" --seed "$seed" --out "$input"
+    fi
+done < "$CELL_LINES"
+
 while IFS=$'\t' read -r cell_id executor mix wcu items prod_rate rep budget seed; do
     run_one "$cell_id" "$executor" "$mix" "$wcu" "$items" "$prod_rate" \
         "$rep" "$budget" "$seed"
