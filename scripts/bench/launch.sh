@@ -43,6 +43,10 @@ INSTANCE_TYPES="${BENCH_INSTANCE_TYPES:-m9g.xlarge:arm64 m8a.xlarge:x86_64}"
 # subnet with internet egress and an egress-only security group.
 SUBNET_ID="${BENCH_SUBNET_ID:-}"
 SECURITY_GROUP="${BENCH_SECURITY_GROUP:-}"
+# Optional SSH key pair for the instances. Interactive access normally goes
+# through SSM Session Manager (no key, no inbound rules needed); a key only
+# helps if SSM itself is broken.
+KEY_NAME="${BENCH_KEY_NAME:-}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -56,6 +60,7 @@ while [ $# -gt 0 ]; do
         --iam-profile) IAM_PROFILE="$2"; shift ;;
         --subnet-id) SUBNET_ID="$2"; shift ;;
         --security-group) SECURITY_GROUP="$2"; shift ;;
+        --key-name) KEY_NAME="$2"; shift ;;
         --quota-wcu) QUOTA_WCU="$2"; shift ;;
         --out-dir) OUT_DIR="$2"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -200,6 +205,9 @@ for pair in $INSTANCE_TYPES; do
         fi
         if [ -n "$SECURITY_GROUP" ]; then
             network_args+=(--security-group-ids "$SECURITY_GROUP")
+        fi
+        if [ -n "$KEY_NAME" ]; then
+            network_args+=(--key-name "$KEY_NAME")
         fi
         run aws ec2 run-instances --region "$REGION" \
             --image-id "$ami" \

@@ -118,6 +118,13 @@ echo "attaching inline policy $POLICY_NAME"
 aws iam put-role-policy --role-name "$ROLE_NAME" \
     --policy-name "$POLICY_NAME" --policy-document "$POLICY_DOC"
 
+# SSM Session Manager access for data rescue: the fleet has no SSH keys and
+# no inbound security-group rules, so SSM (agent preinstalled on AL2023) is
+# the way into a live instance when a run misbehaves.
+echo "attaching AmazonSSMManagedInstanceCore (Session Manager access)"
+aws iam attach-role-policy --role-name "$ROLE_NAME" \
+    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
 if aws iam get-instance-profile --instance-profile-name "$ROLE_NAME" >/dev/null 2>&1; then
     echo "instance profile $ROLE_NAME already exists"
 else
