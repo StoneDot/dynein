@@ -39,6 +39,10 @@ QUOTA_WCU=39000
 OUT_DIR=""
 # type:arch pairs (benchmark-plan.md §5.1 / Q6)
 INSTANCE_TYPES="${BENCH_INSTANCE_TYPES:-m9g.xlarge:arm64 m8a.xlarge:x86_64}"
+# Required in accounts without a default VPC (e.g. Control Tower): a public
+# subnet with internet egress and an egress-only security group.
+SUBNET_ID="${BENCH_SUBNET_ID:-}"
+SECURITY_GROUP="${BENCH_SECURITY_GROUP:-}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -50,6 +54,8 @@ while [ $# -gt 0 ]; do
         --commit) COMMIT_SHA="$2"; shift ;;
         --instances-per-type) INSTANCES_PER_TYPE="$2"; shift ;;
         --iam-profile) IAM_PROFILE="$2"; shift ;;
+        --subnet-id) SUBNET_ID="$2"; shift ;;
+        --security-group) SECURITY_GROUP="$2"; shift ;;
         --quota-wcu) QUOTA_WCU="$2"; shift ;;
         --out-dir) OUT_DIR="$2"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -174,6 +180,13 @@ for pair in $INSTANCE_TYPES; do
             -e "s|{{COMMIT_SHA}}|$COMMIT_SHA|g" \
             -e "s|{{INSTANCE_TYPE}}|$itype|g" \
             "$SCRIPT_DIR/user_data.sh.tpl" > "$userdata"
+        network_args=()
+        if [ -n "$SUBNET_ID" ]; then
+            network_args+=(--subnet-id "$SUBNET_ID")
+        fi
+        if [ -n "$SECURITY_GROUP" ]; then
+            network_args+=(--security-group-ids "$SECURITY_GROUP")
+        fi
         run aws ec2 run-instances --region "$REGION" \
             --image-id "$ami" \
             --instance-type "$itype" \
@@ -181,6 +194,7 @@ for pair in $INSTANCE_TYPES; do
             --iam-instance-profile "Name=$IAM_PROFILE" \
             --instance-initiated-shutdown-behavior terminate \
             --user-data "file://$userdata" \
+            "${network_args[@]}" \
             --tag-specifications \
             "ResourceType=instance,Tags=[{Key=dynein-bench,Value=$RUN_ID},{Key=Name,Value=dynein-bench-$RUN_ID-$itype-s$shard}]"
         shard=$((shard + 1))
