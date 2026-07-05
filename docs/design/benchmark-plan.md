@@ -548,3 +548,14 @@ Safety nets:
   `printf 'y\n' | script -qec "dy ... import ..." /dev/null`
 - Capacity decreases are limited to 4/day/table — another reason for
   fresh-table-per-cell instead of resizing
+- **Provisioned-capacity billing granularity is hourly and the docs do not
+  promise sub-hour proration for short-lived tables** (the DAX section of
+  the billing guide says partial node-hours round up to full hours; the
+  WCU/RCU section is silent). Under the worst reading, N short-lived
+  quota-scale tables bill N table-hours (~$25 each at 39k WCU). The runner
+  therefore reuses one high-WCU table per (wcu, shard) and orders cells so
+  the expensive block runs contiguously last — safe for Tier-1 because
+  these cells never throttle (target = 80% of provisioned, no co-writer),
+  so burst reset is irrelevant. **Verify the actual billing behavior from
+  this run's CUR (UsageType `USW2-WriteCapacityUnit-Hrs`, UsageAmount per
+  hour) and record the answer here**

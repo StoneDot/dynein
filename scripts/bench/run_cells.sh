@@ -3,13 +3,23 @@
 #
 # Reads config.json (schema: see scripts/bench/README.md), selects the cells
 # assigned to this shard, and for each cell x repetition:
-#   1. creates a fresh provisioned table dynein-bench-<run-id>-<cell>-<rep>
-#      (fresh table per rep => burst capacity reset, import-throttling.md §6)
+#   1. creates a provisioned table. Cheap tables (< REUSE_WCU_THRESHOLD) are
+#      fresh per rep (burst capacity reset, import-throttling.md §6);
+#      expensive tables are created once per (wcu, shard) and reused across
+#      cells because DynamoDB bills provisioned capacity at hourly
+#      granularity and the docs do not promise sub-hour proration for
+#      deleted tables — 24 short-lived 39k-WCU tables could bill up to 24
+#      table-hours, one reused table bills its actual wall-clock hours.
+#      Reuse is safe for Tier-1: with the initial target at 80% of the
+#      provisioned WCU and no co-located writer these cells never throttle,
+#      so burst-capacity reset is irrelevant (item overwrites consume the
+#      same WCU as fresh puts)
 #   2. generates the input file with gen_input.py (deterministic seed)
 #   3. optionally starts the pseudo production writer
 #   4. runs `dy import` under /usr/bin/time -v + perf record (if available)
 #      + pidstat, inside a pty (dialoguer prompt) and under `timeout`
 #   5. writes result.json, uploads the artifact dir to S3, deletes the table
+#      (per-rep tables only; reused tables are deleted by the exit cleanup)
 #
 # Usage:
 #   DY_BIN=/path/to/dy [INSTANCE_TYPE=...] [RUNNING_ON_EC2=1] \
@@ -43,6 +53,10 @@ BUCKET="$(cfg bucket)"
 COMMIT_SHA="$(cfg commit_sha)"
 
 S3_PREFIX="s3://$BUCKET/runs/$RUN_ID/results/$INSTANCE_TYPE"
+
+# Tables provisioned at or above this WCU are created once and reused across
+# cells (see the billing note in the header).
+REUSE_WCU_THRESHOLD=1000
 
 log() { printf '[run_cells] %s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
@@ -98,9 +112,14 @@ import json, sys, zlib, math
 cfg = json.load(open(sys.argv[1]))
 shard = int(sys.argv[2])
 AVG_WCU = {"uniform-small": 1.0, "mixed": 2.9, "uniform-large": 35.0}
-for cell in cfg["cells"]:
-    if int(cell.get("shard", 0)) != shard:
-        continue
+# Run cheap cells first and expensive cells last, contiguously: high-WCU
+# tables are reused across cells (billing note in the header), and grouping
+# them keeps the reused table's lifetime — and its billed hours — minimal.
+ordered = sorted(
+    (c for c in cfg["cells"] if int(c.get("shard", 0)) == shard),
+    key=lambda c: c["wcu"],
+)
+for cell in ordered:
     avg = AVG_WCU[cell["mix"]]
     budget = cell.get("budget_secs") or int(math.ceil(cell["items"] * avg / cell["wcu"]) + 300)
     # Deterministic per-cell seed; identical across reps so repetitions
@@ -129,24 +148,33 @@ run_one() {
     mkdir -p "$dir"
     log "=== cell=$cell_id rep=$rep executor=$executor mix=$mix wcu=$wcu items=$items budget=${budget}s table=$table"
 
-    # 1. Fresh table (also resets burst capacity). Quota-scale cells from
+    # 1. Table. Expensive tables are reused across cells (billing note in
+    #    the header); cheap ones are fresh per rep. Quota-scale cells from
     #    several instances can transiently exceed the account-level
     #    provisioned-capacity quota (default 80k WCU); retry with backoff so
     #    the instances serialize on the quota instead of failing the cell.
-    local create_attempts=0
-    until aws dynamodb create-table --region "$REGION" --table-name "$table" \
-        --attribute-definitions AttributeName=pk,AttributeType=S \
-        --key-schema AttributeName=pk,KeyType=HASH \
-        --provisioned-throughput "ReadCapacityUnits=5,WriteCapacityUnits=$wcu" \
-        --tags "Key=dynein-bench,Value=$RUN_ID" >/dev/null 2>"$dir/create-table.err"; do
-        create_attempts=$((create_attempts + 1))
-        if [ "$create_attempts" -ge 30 ]; then
-            log "SKIP cell=$cell_id rep=$rep: create-table kept failing: $(tail -1 "$dir/create-table.err")"
-            return 1
-        fi
-        log "create-table failed (attempt $create_attempts, likely account capacity quota); retrying in 60s"
-        sleep 60
-    done
+    local reuse=0
+    if [ "$wcu" -ge "$REUSE_WCU_THRESHOLD" ]; then
+        reuse=1
+        table="dynein-bench-${RUN_ID}-shared-w${wcu}-${INSTANCE_TYPE}-s${SHARD}"
+    fi
+    if [ "$reuse" = "0" ] || ! aws dynamodb describe-table --region "$REGION" \
+        --table-name "$table" >/dev/null 2>&1; then
+        local create_attempts=0
+        until aws dynamodb create-table --region "$REGION" --table-name "$table" \
+            --attribute-definitions AttributeName=pk,AttributeType=S \
+            --key-schema AttributeName=pk,KeyType=HASH \
+            --provisioned-throughput "ReadCapacityUnits=5,WriteCapacityUnits=$wcu" \
+            --tags "Key=dynein-bench,Value=$RUN_ID" >/dev/null 2>"$dir/create-table.err"; do
+            create_attempts=$((create_attempts + 1))
+            if [ "$create_attempts" -ge 30 ]; then
+                log "SKIP cell=$cell_id rep=$rep: create-table kept failing: $(tail -1 "$dir/create-table.err")"
+                return 1
+            fi
+            log "create-table failed (attempt $create_attempts, likely account capacity quota); retrying in 60s"
+            sleep 60
+        done
+    fi
     aws dynamodb wait table-exists --region "$REGION" --table-name "$table"
 
     # 2. Input file (deterministic; same seed for all reps of a cell, so the
@@ -241,10 +269,14 @@ print(json.dumps({
 }, indent=2))
 PYEOF
 
-    # 6. Upload artifacts, then drop the table.
+    # 6. Upload artifacts, then drop the table. Reused tables stay for the
+    #    following cells and are removed by the exit cleanup (deleting and
+    #    recreating them would multiply the billed table-hours).
     aws s3 cp --recursive "$dir" "$S3_PREFIX/$cell_id/rep$rep/" >/dev/null
-    aws dynamodb delete-table --region "$REGION" --table-name "$table" >/dev/null
-    aws dynamodb wait table-not-exists --region "$REGION" --table-name "$table"
+    if [ "$reuse" = "0" ]; then
+        aws dynamodb delete-table --region "$REGION" --table-name "$table" >/dev/null
+        aws dynamodb wait table-not-exists --region "$REGION" --table-name "$table"
+    fi
 }
 
 while IFS=$'\t' read -r cell_id executor mix wcu items prod_rate rep budget seed; do
