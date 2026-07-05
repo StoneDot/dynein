@@ -129,12 +129,24 @@ run_one() {
     mkdir -p "$dir"
     log "=== cell=$cell_id rep=$rep executor=$executor mix=$mix wcu=$wcu items=$items budget=${budget}s table=$table"
 
-    # 1. Fresh table (also resets burst capacity).
-    aws dynamodb create-table --region "$REGION" --table-name "$table" \
+    # 1. Fresh table (also resets burst capacity). Quota-scale cells from
+    #    several instances can transiently exceed the account-level
+    #    provisioned-capacity quota (default 80k WCU); retry with backoff so
+    #    the instances serialize on the quota instead of failing the cell.
+    local create_attempts=0
+    until aws dynamodb create-table --region "$REGION" --table-name "$table" \
         --attribute-definitions AttributeName=pk,AttributeType=S \
         --key-schema AttributeName=pk,KeyType=HASH \
         --provisioned-throughput "ReadCapacityUnits=5,WriteCapacityUnits=$wcu" \
-        --tags "Key=dynein-bench,Value=$RUN_ID" >/dev/null
+        --tags "Key=dynein-bench,Value=$RUN_ID" >/dev/null 2>"$dir/create-table.err"; do
+        create_attempts=$((create_attempts + 1))
+        if [ "$create_attempts" -ge 30 ]; then
+            log "SKIP cell=$cell_id rep=$rep: create-table kept failing: $(tail -1 "$dir/create-table.err")"
+            return 1
+        fi
+        log "create-table failed (attempt $create_attempts, likely account capacity quota); retrying in 60s"
+        sleep 60
+    done
     aws dynamodb wait table-exists --region "$REGION" --table-name "$table"
 
     # 2. Input file (deterministic; same seed for all reps of a cell, so the

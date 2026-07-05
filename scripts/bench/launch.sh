@@ -32,7 +32,10 @@ BUCKET="${BENCH_BUCKET:-}"
 COMMIT_SHA=""
 INSTANCES_PER_TYPE=2
 IAM_PROFILE="${BENCH_IAM_PROFILE:-dynein-bench-instance}"
-QUOTA_WCU=40000
+# 39k, not the 40k table cap: two instances can then hold one quota-scale
+# table each (2 x 39k + the residual dynein-throttle-exp table fits in the
+# 80k account-level provisioned-capacity quota; 2 x 40k + anything does not).
+QUOTA_WCU=39000
 OUT_DIR=""
 # type:arch pairs (benchmark-plan.md §5.1 / Q6)
 INSTANCE_TYPES="${BENCH_INSTANCE_TYPES:-m9g.xlarge:arm64 m8a.xlarge:x86_64}"
