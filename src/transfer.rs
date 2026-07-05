@@ -580,12 +580,12 @@ fn build_csv_header(
 const BATCH_WRITE_BUFFER_SIZE: usize = 500;
 
 /// Upper bound on the number of items resident in the import pipeline at
-/// once (main channel + chunker batch + process channel + in-flight requests
-/// + retry queue). With streaming file reads the input size no longer bounds
-/// memory, and the unbounded retry channel needs a new bound: the producer
-/// acquires one admission permit per item and the permit is released only
-/// when the item is finally resolved (written or permanently failed), so
-/// retries circulate without interfering with admission.
+/// once (main channel, chunker batch, process channel, in-flight requests
+/// and the retry queue). With streaming file reads the input size no longer
+/// bounds memory, and the unbounded retry channel needs a new bound: the
+/// producer acquires one admission permit per item and the permit is
+/// released only when the item is finally resolved (written or permanently
+/// failed), so retries circulate without interfering with admission.
 ///
 /// Sizing: the steady-state population needed to saturate the highest
 /// targets is roughly main channel (500) + process channel (16×25) + the
@@ -600,10 +600,10 @@ const ADMISSION_ITEM_CAP: usize = 10_000;
 /// the beginning; the AIMD recovery then probes for the remaining capacity.
 const INITIAL_TARGET_RATIO_OF_PROVISIONED: f64 = 0.8;
 
-/// The default warm throughput of on-demand tables (4,000 WCU).
-/// The aws-sdk-dynamodb version in use does not expose the `warm_throughput`
-/// field of DescribeTable yet; once the SDK is upgraded, read the actual value
-/// from the table description instead of assuming the platform default.
+/// The platform-default warm throughput of on-demand tables (4,000 WCU).
+/// Used as the fallback when DescribeTable does not report the table's
+/// actual warm throughput (`warm_write_units`), and as the finite starting
+/// point that an unbounded ceiling requires when no capacity hint exists.
 const DEFAULT_ON_DEMAND_WARM_WCU: f64 = 4000.0;
 
 /// Capacity-related hints for congestion control, derived from table information.
@@ -632,13 +632,30 @@ async fn capacity_hints(cx: &app::Context, ts: &app::TableSchema) -> CapacityHin
                 provisioned_wcu,
             }
         }
-        // The slow loop is not enabled for on-demand tables for now: they have
-        // no clear capacity reference to compute available headroom against.
-        table::Mode::OnDemand => CapacityHints {
-            initial_wcu: Some(DEFAULT_ON_DEMAND_WARM_WCU),
-            provisioned_wcu: None,
-        },
+        // The slow loop is not enabled for on-demand tables for now: warm
+        // throughput says what the table absorbs instantly, but using it as
+        // the headroom reference for boosts is a semantic extension that has
+        // not been designed yet.
+        table::Mode::OnDemand => {
+            let desc = control::describe_table_api(cx, ts.name.clone()).await;
+            CapacityHints {
+                // The actual warm throughput of the table: what it can absorb
+                // right now without ramping up. Tables that never scaled keep
+                // the platform default, so the fallback rarely matters.
+                initial_wcu: Some(warm_write_units(&desc).unwrap_or(DEFAULT_ON_DEMAND_WARM_WCU)),
+                provisioned_wcu: None,
+            }
+        }
     }
+}
+
+/// The table's warm throughput for writes (units/second) as reported by
+/// DescribeTable, if present.
+fn warm_write_units(desc: &aws_sdk_dynamodb::types::TableDescription) -> Option<f64> {
+    desc.warm_throughput
+        .as_ref()
+        .and_then(|w| w.write_units_per_second)
+        .map(|units| units as f64)
 }
 
 /// Interval of the slow control loop. Aligned with the CloudWatch metric
@@ -1849,6 +1866,33 @@ mod tests {
         assert!(v["tokio"]["total_poll_duration_us"].is_u64());
         assert!(v["tokio"]["total_scheduled_duration_us"].is_u64());
         assert!(v["tokio"]["total_slow_poll_count"].is_u64());
+    }
+
+    #[test]
+    fn test_warm_write_units_reads_describe_table() {
+        let desc = aws_sdk_dynamodb::types::TableDescription::builder()
+            .warm_throughput(
+                aws_sdk_dynamodb::types::TableWarmThroughputDescription::builder()
+                    .read_units_per_second(12_000)
+                    .write_units_per_second(4_000)
+                    .build(),
+            )
+            .build();
+        assert_eq!(warm_write_units(&desc), Some(4_000.0));
+    }
+
+    #[test]
+    fn test_warm_write_units_absent_when_not_reported() {
+        let desc = aws_sdk_dynamodb::types::TableDescription::builder().build();
+        assert_eq!(warm_write_units(&desc), None);
+
+        // warm_throughput present but without a write value.
+        let desc = aws_sdk_dynamodb::types::TableDescription::builder()
+            .warm_throughput(
+                aws_sdk_dynamodb::types::TableWarmThroughputDescription::builder().build(),
+            )
+            .build();
+        assert_eq!(warm_write_units(&desc), None);
     }
 
     #[test]

@@ -31,7 +31,7 @@ path = "src/main.rs"
 
 [dependencies]
 aws-config       = "1.5.12"
-aws-sdk-dynamodb = "1.28.0"
+aws-sdk-dynamodb = "1.93.0" # >= warm throughput support (TableDescription::warm_throughput)
 aws-sdk-ec2      = "1.42.0"
 aws-smithy-runtime-api = "1.6.0"
 aws-smithy-types = "1.1.9"

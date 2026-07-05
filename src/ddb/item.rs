@@ -111,7 +111,7 @@ pub fn calculate_estimated_attr_size(
 
 fn calc_num_size(num: &str) -> Result<usize, NumberParseError> {
     let (frac, _exp) = calc_digits(num.as_bytes())?;
-    Ok((frac as usize + 1) / 2 + 1)
+    Ok((frac as usize).div_ceil(2) + 1)
 }
 
 ///
