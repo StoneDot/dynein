@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 use crate::algo::bucket::Bucket;
-use crate::algo::congestion::{AimdController, BoostSlot, CongestionStats};
+use crate::algo::congestion::{AimdController, BoostSlot, CongestionStats, TargetGauge};
 use crate::algo::monitor::{Monitor, Probe};
 use futures::future::join_all;
 use itertools::Itertools;
-use log::{debug, info, trace};
+use log::{debug, error, info, trace};
 use rand::random;
 use std::fmt::Debug;
 use std::future::Future;
@@ -138,9 +138,9 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledWor
     }
 }
 
-struct StatDataPoint {
-    avg: f64,
-    std_dev: f64,
+pub(crate) struct StatDataPoint {
+    pub(crate) avg: f64,
+    pub(crate) std_dev: f64,
 }
 
 pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
@@ -169,36 +169,45 @@ pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
     seen_throttled: usize,
     /// Latest safe-target suggestion from the slow control loop
     boost_slot: Arc<BoostSlot>,
+    /// Publishes the current effective target for external observers
+    target_gauge: Arc<TargetGauge>,
+    /// Capacity of each per-worker queue (benchmark axis; see benchmark-plan.md Q3)
+    queue_depth: usize,
+    /// Instruments the worker tasks for the benchmark stats
+    task_monitor: tokio_metrics::TaskMonitor,
 }
 
 // Even if round trip time is 1s, we can achieve specified WCU with this setting
 // unless latency is too high.
-const MINIMUM_WORKER_TARGET_LIMIT: f64 = 1.0;
+pub(crate) const MINIMUM_WORKER_TARGET_LIMIT: f64 = 1.0;
 
-const NUM_MONITORING_OBSERVATIONS: usize = 256;
-const NUM_STATS_OBSERVATIONS: usize = 256;
-const CHANNEL_BUFFER_SIZE: usize = 16;
+pub(crate) const NUM_MONITORING_OBSERVATIONS: usize = 256;
+pub(crate) const NUM_STATS_OBSERVATIONS: usize = 256;
 
-const MAX_CLIENT_GENERATION_PER_SECOND: f64 = 10.0;
+pub(crate) const MAX_CLIENT_GENERATION_PER_SECOND: f64 = 10.0;
 
-const DEFAULT_MAX_CONCURRENT_CONNECTION: usize = 1024;
+pub(crate) const DEFAULT_MAX_CONCURRENT_CONNECTION: usize = 1024;
 
-const SIGMA: f64 = 3.0;
+pub(crate) const SIGMA: f64 = 3.0;
 
-const SIGMA_CROSS_AVG: f64 = 2.0;
+pub(crate) const SIGMA_CROSS_AVG: f64 = 2.0;
 
-const SCALE_WAIT_FACTOR: f64 = 3.0;
+pub(crate) const SCALE_WAIT_FACTOR: f64 = 3.0;
 
 impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExecutor<T> {
     /// Creates an executor. `target_limit` is the user-specified ceiling of the
     /// resource consumption. `initial_target` optionally gives a more realistic
     /// starting point derived from known information (e.g. provisioned capacity);
-    /// when `None`, the executor starts at the ceiling.
-    pub fn new(
+    /// when `None`, the executor starts at the ceiling. `queue_depth` is the
+    /// per-worker queue capacity (the production default is 16; candidate A′
+    /// of the benchmark plan uses 1).
+    pub fn with_queue_depth(
         recv: Receiver<T>,
         target_limit: f64,
         initial_target: Option<f64>,
+        queue_depth: usize,
     ) -> ThrottledExecutor<T> {
+        assert!(queue_depth >= 1);
         let (probe, monitor) = Monitor::new(NUM_MONITORING_OBSERVATIONS, NUM_STATS_OBSERVATIONS);
         let min_target = MINIMUM_WORKER_TARGET_LIMIT.min(target_limit);
         let mut initial = ThrottledExecutor {
@@ -222,6 +231,13 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             seen_requests: 0,
             seen_throttled: 0,
             boost_slot: Arc::new(BoostSlot::default()),
+            target_gauge: Arc::new(TargetGauge::new(
+                initial_target
+                    .unwrap_or(target_limit)
+                    .clamp(MINIMUM_WORKER_TARGET_LIMIT.min(target_limit), target_limit),
+            )),
+            queue_depth,
+            task_monitor: tokio_metrics::TaskMonitor::new(),
         };
         info!(
             "Executor starts with the effective target {:.2} (ceiling: {:.2})",
@@ -247,10 +263,26 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         self.boost_slot.clone()
     }
 
+    /// Gauge publishing the current effective target.
+    pub fn target_gauge(&self) -> Arc<TargetGauge> {
+        self.target_gauge.clone()
+    }
+
+    /// Capacity of each per-worker queue.
+    #[cfg(test)]
+    pub fn queue_depth(&self) -> usize {
+        self.queue_depth
+    }
+
+    /// Monitor instrumenting the worker tasks.
+    pub fn task_monitor(&self) -> tokio_metrics::TaskMonitor {
+        self.task_monitor.clone()
+    }
+
     fn create_worker(&mut self, target_total_worker_num: usize) {
         let target_limit = self.congestion.effective_target() / target_total_worker_num as f64;
         let jitter_sec = random::<f64>() * self.jitter_max_secs(target_total_worker_num);
-        let (tx, rx) = channel::<Signal<T>>(CHANNEL_BUFFER_SIZE);
+        let (tx, rx) = channel::<Signal<T>>(self.queue_depth);
         let bucket = Bucket::new(target_limit, target_limit);
         let worker = ThrottledWorker::new(
             rx,
@@ -260,10 +292,11 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             self.congestion_stats.clone(),
         );
         self.workers_tx.push(tx);
-        self.workers_handle.push(tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs_f64(jitter_sec)).await;
-            worker.start().await;
-        }));
+        self.workers_handle
+            .push(tokio::spawn(self.task_monitor.instrument(async move {
+                tokio::time::sleep(Duration::from_secs_f64(jitter_sec)).await;
+                worker.start().await;
+            })));
     }
 
     /// Runs the throttled executor, distributing incoming messages to workers in a round-robin
@@ -326,6 +359,14 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
 
         // When input channel is closed, all workers should be terminated.
         let result = self.terminate_all_workers().await;
+
+        // Wait until every worker has drained its queue and exited, so that
+        // returning from run() means all accepted work has been processed.
+        for handle in self.workers_handle.drain(..) {
+            if let Err(e) = handle.await {
+                error!("A worker task failed: {}", e);
+            }
+        }
 
         // Check whether all workers are terminated successfully.
         let result: Vec<_> = result.into_iter().filter_map(|item| item.err()).collect();
@@ -399,6 +440,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         }
 
         if let Some(new_target) = changed {
+            self.target_gauge.set(new_target);
             let target_each_worker = new_target / self.num_workers() as f64;
             let mut futures = Vec::with_capacity(self.workers_tx.len() * 2);
             for tx in &self.workers_tx {
@@ -592,6 +634,15 @@ mod test {
         assert_timing!(0, 0.1, assert_eq!(rx.recv().unwrap(), Message::Estimated));
         assert_eq!(process.process_and_consume_resource().await.consumed, 2f64);
         assert_timing!(0, 0.1, assert_eq!(rx.recv().unwrap(), Message::Consumed));
+    }
+
+    #[tokio::test]
+    async fn test_with_queue_depth_and_target_gauge() {
+        let (_tx, rx) = channel::<TestProcess>(1);
+        let executor = ThrottledExecutor::with_queue_depth(rx, 100.0, Some(40.0), 1);
+        assert_eq!(executor.queue_depth(), 1);
+        // The gauge publishes the initial effective target right away.
+        assert_eq!(executor.target_gauge().get(), 40.0);
     }
 
     #[tokio::test]

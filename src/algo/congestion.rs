@@ -123,6 +123,27 @@ impl BoostSlot {
     }
 }
 
+/// A lock-free gauge publishing the current effective target so that
+/// observers outside the executor (e.g. the benchmark stats emitter) can read
+/// it without extra channels. Executors update it whenever the effective
+/// target changes.
+#[derive(Debug)]
+pub struct TargetGauge(AtomicU64);
+
+impl TargetGauge {
+    pub fn new(initial: f64) -> TargetGauge {
+        TargetGauge(AtomicU64::new(initial.to_bits()))
+    }
+
+    pub fn set(&self, target: f64) {
+        self.0.store(target.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> f64 {
+        f64::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
+
 /// Estimates a safe effective target from the table-level consumption
 /// observed via CloudWatch.
 ///
@@ -429,6 +450,14 @@ mod tests {
         stats.record(false, 0.0);
         assert_eq!(stats.snapshot(), (3, 1));
         assert!((stats.consumed() - 3.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_target_gauge_publishes_latest_value() {
+        let gauge = TargetGauge::new(5.0);
+        assert_eq!(gauge.get(), 5.0);
+        gauge.set(7.5);
+        assert_eq!(gauge.get(), 7.5);
     }
 
     #[test]

@@ -714,6 +714,105 @@ async fn slow_control_loop(
     }
 }
 
+/// Environment variable enabling the benchmark stats emitter: when set to a
+/// file path, a JSON line of cumulative counters is appended every second.
+/// Machine-readable by design — the benchmark harness must not parse human
+/// logs (docs/design/benchmark-plan.md §4).
+const BENCH_STATS_ENV: &str = "DYNEIN_BENCH_STATS";
+
+/// Interval between two benchmark stats lines.
+const BENCH_STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Renders one line of the benchmark stats stream. All counters are
+/// cumulative since the start of the import.
+#[allow(clippy::too_many_arguments)]
+fn render_bench_stats_line(
+    elapsed_secs: f64,
+    consumed_wcu: f64,
+    requests: usize,
+    throttled: usize,
+    effective_target: f64,
+    resolved_items: usize,
+    failed_items: usize,
+    task_metrics: Option<&tokio_metrics::TaskMetrics>,
+) -> String {
+    let mut line = serde_json::json!({
+        "t": elapsed_secs,
+        "consumed_wcu": consumed_wcu,
+        "requests": requests,
+        "throttled": throttled,
+        "effective_target": effective_target,
+        "resolved_items": resolved_items,
+        "failed_items": failed_items,
+    });
+    if let Some(m) = task_metrics {
+        line["tokio"] = serde_json::json!({
+            "instrumented_count": m.instrumented_count,
+            "total_poll_count": m.total_poll_count,
+            "total_poll_duration_us": m.total_poll_duration.as_micros() as u64,
+            "total_scheduled_count": m.total_scheduled_count,
+            "total_scheduled_duration_us": m.total_scheduled_duration.as_micros() as u64,
+            "total_slow_poll_count": m.total_slow_poll_count,
+        });
+    }
+    line.to_string()
+}
+
+/// Spawns the benchmark stats emitter when `DYNEIN_BENCH_STATS` is set.
+/// The task appends one stats line per second and a final line when the
+/// pipeline signals termination, so short runs still produce a series.
+#[allow(clippy::too_many_arguments)]
+fn spawn_bench_stats_emitter(
+    path: String,
+    stats: Arc<algo::congestion::CongestionStats>,
+    target_gauge: Arc<algo::congestion::TargetGauge>,
+    task_monitor: tokio_metrics::TaskMonitor,
+    complete_items_count: Arc<AtomicUsize>,
+    failed_items_count: Arc<AtomicUsize>,
+    mut terminate_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut file = match fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to open the bench stats file '{}': {}", path, e);
+                return;
+            }
+        };
+        let start = Instant::now();
+        let emit = |file: &mut fs::File| {
+            let (requests, throttled) = stats.snapshot();
+            let line = render_bench_stats_line(
+                start.elapsed().as_secs_f64(),
+                stats.consumed(),
+                requests,
+                throttled,
+                target_gauge.get(),
+                complete_items_count.load(Ordering::Relaxed),
+                failed_items_count.load(Ordering::Relaxed),
+                Some(&task_monitor.cumulative()),
+            );
+            if let Err(e) = writeln!(file, "{}", line) {
+                error!("Failed to write the bench stats file '{}': {}", path, e);
+                return false;
+            }
+            true
+        };
+        loop {
+            select! {
+                _ = tokio::time::sleep(BENCH_STATS_INTERVAL) => {
+                    if !emit(&mut file) {
+                        return;
+                    }
+                }
+                _ = terminate_rx.changed() => break,
+            }
+        }
+        // Final datapoint so that the series always covers the full run.
+        emit(&mut file);
+    })
+}
+
 /// Aborts the import when no progress has been made for this long.
 /// This is the safety valve against livelocks (e.g. transport errors retried
 /// forever after the network died); see the design document.
@@ -1017,7 +1116,12 @@ async fn stream_writes_with_chucked(
 
     // This channel is used to queue each a BatchWriteItem request.
     let (tx2, rx2) = tokio::sync::mpsc::channel::<BatchWriteProcess>(16);
-    let mut executor = algo::worker::ThrottledExecutor::new(rx2, max_wcu, hints.initial_wcu);
+    // The executor architecture is selectable via DYNEIN_BENCH_EXECUTOR while
+    // the benchmark of docs/design/benchmark-plan.md is being settled.
+    let executor_kind = algo::executor::ExecutorKind::from_env();
+    info!("Using executor architecture {:?}", executor_kind);
+    let mut executor =
+        algo::executor::AnyExecutor::new(executor_kind, rx2, max_wcu, hints.initial_wcu);
 
     // Start the slow control loop when a capacity reference is known. It
     // consults CloudWatch to recover more aggressively when it looks safe.
@@ -1035,6 +1139,22 @@ async fn stream_writes_with_chucked(
     } else {
         None
     };
+
+    // Benchmark instrumentation (no-op unless DYNEIN_BENCH_STATS is set).
+    let bench_stats_handle = std::env::var(BENCH_STATS_ENV)
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(|path| {
+            spawn_bench_stats_emitter(
+                path,
+                executor.congestion_stats(),
+                executor.target_gauge(),
+                executor.task_monitor(),
+                complete_items_count.clone(),
+                failed_items_count.clone(),
+                terminate_rx.clone(),
+            )
+        });
 
     // This channel is used to retry unprocessed items. It must be unbounded to avoid
     // a deadlock: workers enqueue retries while the chunking process may be blocked
@@ -1199,6 +1319,12 @@ async fn stream_writes_with_chucked(
     if let Some(handle) = slow_loop_handle {
         // The slow control loop exits on the termination signal sent above.
         handle.await.expect("Failed to wait the slow control loop");
+    }
+    if let Some(handle) = bench_stats_handle {
+        // The stats emitter exits on the termination signal sent above.
+        handle
+            .await
+            .expect("Failed to wait the bench stats emitter");
     }
 
     // Stop visualization task
@@ -1415,6 +1541,37 @@ mod tests {
         assert_eq!(summary.successful_items, 0);
         assert_eq!(summary.failed_items, 2);
         assert!(summary.retry_requests.is_empty());
+    }
+
+    #[test]
+    fn test_render_bench_stats_line_without_task_metrics() {
+        let line = render_bench_stats_line(1.5, 12.25, 10, 2, 80.0, 250, 1, None);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["t"], 1.5);
+        assert_eq!(v["consumed_wcu"], 12.25);
+        assert_eq!(v["requests"], 10);
+        assert_eq!(v["throttled"], 2);
+        assert_eq!(v["effective_target"], 80.0);
+        assert_eq!(v["resolved_items"], 250);
+        assert_eq!(v["failed_items"], 1);
+        assert!(v.get("tokio").is_none());
+        // One JSON object per line: the rendered line must not contain newlines.
+        assert!(!line.contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn test_render_bench_stats_line_with_task_metrics() {
+        let monitor = tokio_metrics::TaskMonitor::new();
+        monitor.instrument(async {}).await;
+        let metrics = monitor.cumulative();
+
+        let line = render_bench_stats_line(2.0, 0.0, 0, 0, 10.0, 0, 0, Some(&metrics));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["tokio"]["instrumented_count"], 1);
+        assert!(v["tokio"]["total_poll_count"].is_u64());
+        assert!(v["tokio"]["total_poll_duration_us"].is_u64());
+        assert!(v["tokio"]["total_scheduled_duration_us"].is_u64());
+        assert!(v["tokio"]["total_slow_poll_count"].is_u64());
     }
 
     #[test]

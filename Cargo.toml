@@ -60,8 +60,11 @@ thiserror = "1.0.59"
 home = "0.5.9"
 rand = "0.8.5"
 aws-sdk-cloudwatch = "1.29.0"
+async-channel = "2.3.1" # shared MPMC process queue (benchmark candidate B)
+tokio-metrics = { version = "0.4", default-features = false } # task-level metrics for the executor benchmark; runtime metrics would additionally need --cfg tokio_unstable
 
 [dev-dependencies]
+tokio = { version = "1.37.0", features = ["full", "test-util"] } # test-util enables paused virtual time for the algo simulations
 assert_cmd = "2.0.14" # contains helpers make executing the main binary on integration tests easier.
 predicates = "3.1.0" # to introduce advanced assertions
 once_cell = "1.19.0" # to setup docker container syncrhonously

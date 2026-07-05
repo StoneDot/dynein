@@ -137,7 +137,28 @@ impl Bucket {
     ///
     /// * `adjust` - The value by which to adjust the capacity. You can calculate it by `estimate - actual`.
     pub fn feedback(&mut self, adjust: f64) {
-        self.cap += adjust;
+        // A positive refund clamps at max_cap: on a shared bucket, other
+        // requests may have consumed and refilled in between, so the refund
+        // can arrive while the bucket is already (nearly) full.
+        self.cap = (self.cap + adjust).min(self.max_cap);
         when_debug!(self.inspect_internal_state());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_feedback_refund_is_clamped_at_max_cap() {
+        let mut bucket = Bucket::new(2.0, 1.0);
+        bucket.fill();
+        // On a shared bucket, other requests may consume and refill between
+        // one request's consume and its feedback, so a positive refund can
+        // arrive while the bucket is already full. It must clamp at max_cap
+        // instead of overflowing.
+        bucket.feedback(1.5);
+        assert!(bucket.try_consume(2.0));
+        assert!(!bucket.try_consume(1.5));
     }
 }
