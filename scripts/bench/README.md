@@ -137,8 +137,18 @@ Uploaded to
   (`DYNEIN_BENCH_STATS`): one JSON object per line with cumulative
   `consumed_wcu`, `requests`, `throttled`, `resolved_items`, `failed_items`,
   the current `effective_target`, and optional `tokio` task metrics
-- `run.log`, `time.txt`, `pidstat.txt`, `perf.data` (perf is skipped
-  gracefully when unavailable), `prod.log` (prod-on cells)
+- system-level 1s samplers, identical for every cell (needed to *explain*
+  anomalies, not just detect them):
+  - `mpstat.txt` — per-core %usr/%sys/%iowait/%irq/%soft/**%steal**
+  - `iostat.txt` — per-device r/s, w/s, MB/s, await, **aqu-sz** (queue
+    depth), %util (the gp3 root volume is a 125MB/s device)
+  - `meminfo.txt` — MemFree/MemAvailable/Buffers/**Cached**/Dirty/Writeback
+    (page-cache behavior of the streaming reads)
+  - `netdev.txt` — cumulative interface byte/packet/error counters
+  - `pidstat.txt` — dy's own CPU, RSS, disk I/O (-d) and context
+    switches (-w)
+- `run.log`, `time.txt`, `perf.data` (perf is skipped gracefully when
+  unavailable), `prod.log` (prod-on cells)
 
 `analyze.py` turns the tree into the §4 comparison table: wall time,
 effective items/s, completion tail t(100%)−t(90%), target adherence

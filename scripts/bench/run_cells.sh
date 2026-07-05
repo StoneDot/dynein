@@ -293,12 +293,43 @@ run_one() {
         prod_pid=$!
     fi
 
-    # 4. Background system sampling.
-    local pidstat_pid=""
+    # 4. Background system sampling (1s cadence, identical for every cell so
+    #    it cannot bias the comparison). Process-level pidstat is joined by
+    #    system-level samplers: benchmark anomalies need %steal/%iowait,
+    #    page-cache behavior and disk queue depth to be explainable, not
+    #    just dy's own CPU/RSS.
+    local sampler_pids=()
     if [ "$PIDSTAT_OK" = "1" ]; then
-        pidstat -h -u -r -C dy 1 > "$dir/pidstat.txt" 2>&1 &
-        pidstat_pid=$!
+        # -d: dy's own disk I/O; -w: its context switches.
+        pidstat -h -u -r -d -w -C dy 1 > "$dir/pidstat.txt" 2>&1 &
+        sampler_pids+=($!)
+        # Per-core CPU incl. %usr %sys %iowait %irq %soft %steal.
+        mpstat -P ALL 1 > "$dir/mpstat.txt" 2>&1 &
+        sampler_pids+=($!)
     fi
+    if command -v iostat >/dev/null 2>&1; then
+        # Extended device stats: r/s w/s rMB/s wMB/s await aqu-sz %util.
+        iostat -dxz 1 > "$dir/iostat.txt" 2>&1 &
+        sampler_pids+=($!)
+    fi
+    # Page cache / dirty writeback / available memory, straight from /proc.
+    (
+        while true; do
+            date -u +%FT%TZ
+            grep -E '^(MemFree|MemAvailable|Buffers|Cached|Dirty|Writeback|SwapFree):' /proc/meminfo
+            sleep 1
+        done
+    ) > "$dir/meminfo.txt" 2>&1 &
+    sampler_pids+=($!)
+    # Interface byte/packet/error counters (cumulative; diff at analysis).
+    (
+        while true; do
+            date -u +%FT%TZ
+            grep -v -e 'lo:' -e '|' -e 'face' /proc/net/dev
+            sleep 1
+        done
+    ) > "$dir/netdev.txt" 2>&1 &
+    sampler_pids+=($!)
 
     # The import command. dialoguer's provisioned-table prompt needs a pty
     # (import-throttling.md §6), hence `script -qec`. /usr/bin/time -v gives
@@ -323,7 +354,10 @@ env DYNEIN_BENCH_STATS='$dir/stats.jsonl' DYNEIN_BENCH_EXECUTOR='$executor' RUST
     ended=$(date +%s)
     log "cell=$cell_id rep=$rep finished: exit=$rc wall=$((ended - started))s"
 
-    [ -n "$pidstat_pid" ] && { kill "$pidstat_pid" 2>/dev/null || true; }
+    local sp
+    for sp in "${sampler_pids[@]}"; do
+        kill "$sp" 2>/dev/null || true
+    done
     if [ -n "$prod_pid" ]; then
         kill "$prod_pid" 2>/dev/null || true
         wait "$prod_pid" 2>/dev/null || true
