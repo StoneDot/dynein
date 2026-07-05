@@ -12,6 +12,11 @@
 set -euxo pipefail
 exec > /var/log/dynein-bench.log 2>&1
 
+# cloud-init runs this as root but WITHOUT $HOME in the environment; with
+# `set -u` the rustup env sourcing below would abort the whole bootstrap
+# ("HOME: unbound variable" — found the hard way, benchmark run 090552).
+export HOME=/root
+
 RUN_ID="{{RUN_ID}}"
 SHARD="{{SHARD}}"
 BUCKET="{{BUCKET}}"
