@@ -183,7 +183,31 @@ rules). Summary:
   would have distorted results as noise
 - Close the losing branch when Q5 is settled
 
-## 6. Empirical Findings (2026-07-04)
+## 6. Empirical Findings
+
+### 2026-07-05 (benchmark preparation)
+
+- **Bucket floating-point livelock (real bug, found by simulation)**:
+  `Bucket::estimate_available_at` returned the exact-remainder wait; near
+  the token boundary the matching f64 refill increment rounds to zero, so
+  the wait loop (sleep remainder → refill → retry) stops progressing — a
+  busy CPU spin in real time (each iteration adds µs of wall clock, so it
+  eventually escapes, wasting CPU), a hard livelock under virtual time.
+  Fixed with a 1ms wait floor. `Bucket::feedback` also clamps positive
+  refunds at `max_cap` now (required for candidate C's shared bucket)
+- **`ThrottledExecutor::run` now waits for worker termination** (it used to
+  await only the Close sends), so run() returning means all accepted work
+  was processed — the executor is usable standalone, without the item
+  accounting of transfer.rs, e.g. in the simulations
+- Executor candidates (`DYNEIN_BENCH_EXECUTOR=pool16|pool1|mpmc|task`) and
+  their small-WCU live validation, plus the phase-1 simulation predictions:
+  see `benchmark-plan.md` §0 and §2.6. Highlights: C's AIMD (shared-bucket
+  refill update) halved and recovered correctly under a live throttle;
+  production-first held on the new executors; the simulation predicts C
+  removes the scale-out ramp-up penalty entirely in the high-rate regime
+  (CPU cost remains unmeasured until EC2)
+
+### 2026-07-04
 
 - The old implementation (missing retry re-queueing) reproducibly **hung forever at 561/2000** on a 2-WCU table with 2000 items. About 57 fully-throttled requests × 25 items ≈ 1439 items were silently lost
 - After the fix: five 2000-item runs at 25 WCU and one 300-item run under sustained throttling at 2 WCU — all exit 0 with exact table counts

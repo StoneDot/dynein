@@ -28,6 +28,18 @@ run.
   not wired), input generator (`scripts/bench/gen_input.py`)
 - [x] Harness scripts (`scripts/bench/`, incl. `setup_aws.sh` — **not
   executed**: S3 bucket + IAM instance profile do not exist yet)
+- [x] Small-WCU live validation of all four candidates (2026-07-05, tables
+  `dynein-bench-valid` 20 WCU / `dynein-throttle-exp` 2 WCU, both cleaned
+  up): 4 × 250-item smoke imports → exit 0, table count exactly 1000, stats
+  emitter + TaskMonitor counters sane, ~18 items/s each (= the 16 WCU/s
+  initial target). Under a concurrent 3 WCU/s pseudo-production writer, the
+  `task` executor's AIMD halved 1.76 → 1.0 on a live throttle and recovered
+  (1.1, 1.21) after the writer stopped, finishing 300/300 with exit 0; in
+  the 2 WCU/s-writer run the import backed off so well the production
+  writer saw **zero** throttles (production-first policy holds on the new
+  executors). Beware: two earlier runs produced no throttling at all
+  because burst capacity re-accumulated within minutes — drain immediately
+  before measuring (§8)
 - [ ] S3 bucket + IAM instance profile created (run `setup_aws.sh` once)
 - [ ] Tier-1 EC2 sweep → decision per §7
 
