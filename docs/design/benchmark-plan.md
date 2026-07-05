@@ -78,7 +78,7 @@ run.
 | A  | Current: fixed pool, per-worker queue (depth 16), round-robin `try_send` with skip-on-full, split buckets (`target/n`) | Baseline = branch HEAD |
 | A′ | A with per-worker queue depth 1 (`CHANNEL_BUFFER_SIZE` 16→1) | One-line change; isolates the queue-depth-skew effect (Q3) |
 | B  | Shared MPMC process queue (async-channel), fixed workers pulling, split buckets | Work-conserving queueing while keeping the pool model |
-| C  | Task-per-request: chunker acquires a `Semaphore` permit (max concurrency = current `DEFAULT_MAX_CONCURRENT_CONNECTION`), spawns one tokio task per BatchWriteItem request, **shared bucket** (single rate limiter), AIMD updates the shared refill directly | Removes Signal channels, round-robin, and all scale-out logic; concurrency emerges from rate × latency. Reuses `ResourceConstraintProcess` unchanged |
+| C  | Task-per-request: one tokio task per BatchWriteItem request, **shared bucket** (single rate limiter), AIMD updates the shared refill directly. The in-flight cap starts at 1 and is grown by the same `ScaleOutGovernor` that drives the pools' worker scale-out (`task<N>` sets the growth ceiling, default 256) | Removes Signal channels and round-robin; the *pacing* concurrency emerges from rate × latency while the governor keeps the cap from climbing when growth stops helping. Reuses `ResourceConstraintProcess` unchanged |
 
 Chunker variants (Q5, combined only with A/A′/B): `single` (current) vs
 `multi8` (the async-channel branch approach).
@@ -248,6 +248,14 @@ saturates at ~8.4k items/s, i.e. an unreachable target**:
   per-process temporary credentials made tables "vanish" between
   invocations until static dummy credentials were exported
 
+**Update (2026-07-05, after the governor extraction and estimator fix of
+§2.7.2)** — the uniform-small simulation improved for every candidate (the
+unbiased throughput estimator makes ramp decisions sounder): A 5.84s/34.2%,
+A′ 6.83s/29.3%, B 5.07s/39.5%, C 4.74s/42.2% (tail 0.18s). C no longer gets
+the ungoverned 2.0s: adaptive in-flight control trades cold-start ramp for
+saturation robustness, and still leads this regime. Rate-bound scenarios
+are unchanged.
+
 ### 2.7.1 Brush-up after the structural review (2026-07-05, same day)
 
 The review concluded C's collapse was **implementation-level, not
@@ -301,6 +309,51 @@ Post-fix numbers (same cells; v1 = §2.7 table above):
   as the pool's per-worker behavior; (c) request-task panics in C drop the
   permit and lose the item, converging to the stall deadline — the same
   failure mode and safety net as a pool worker panic
+
+### 2.7.2 Adaptive in-flight control for C (2026-07-05, third pass)
+
+The essential control problem is the same in every architecture: **the
+number of parallel in-flight requests against the required throughput**.
+The pools solve it implicitly (monitor-driven worker scale-out with an
+effectiveness check); C had nothing but a fixed cap. The pool's decision
+logic was extracted into a shared `ScaleOutGovernor` (`src/algo/governor.rs`)
+— grow only when measured throughput is statistically below the effective
+target, stop when growing stops helping, freeze during congestion — and C
+now grows its in-flight cap (from 1, doubling, ceiling = `task<N>`,
+default 256) under exactly that logic.
+
+The extraction surfaced two real bugs in the shared math, fixed with tests:
+
+1. **Monitor fencepost bias**: `average_per_second` divided the sum of all
+   n window values by the (n−1) intervals spanning them — up to 2×
+   overestimation on small windows, phase-dependent bias and inflated
+   variance that made the effectiveness comparison unreliable (it silently
+   degraded the pools' scale-out decisions too, hidden until now by the
+   bias itself). The estimator now excludes the oldest value
+2. **Effectiveness edge**: the veto used a strict `>`; with an unbiased
+   estimator a saturated server reproduces the previous throughput
+   *exactly*, and "exactly equal" must count as "growth did not help"
+
+DynamoDB Local re-measurement (v3; single runs):
+
+| candidate | cell 1 (4k, reachable) | cell 2 (32k, saturated) | growth path |
+|---|---|---|---|
+| A pool16 | 30.1s / 3,991/s | 50.9s / 7,853/s / 6.9s CPU | workers 1→2→4 |
+| A′ pool1 | 30.1s / 3,992/s | 50.8s / 7,869/s / 6.8s CPU | workers 1→2→4 |
+| B mpmc | 30.1s / 3,991/s | 47.8s / **8,371/s** / **5.5s** CPU | workers →16 |
+| C task (adaptive) | 30.1s / 3,991/s | 51.0s / 7,849/s / 6.5s CPU | cap 1→2→**4** |
+
+- **C self-tunes to the saturation knee**: the cap stopped at 4 (sub-ms
+  local latency needs no more) and throughput landed within noise of the
+  pools — no hand-tuned cap, confirming the earlier `task32` result was
+  just a manual stand-in for the missing governor
+- The stricter (unbiased) veto also stops the pools earlier (4 workers vs
+  16 in v1/v2) at a few percent lower saturated throughput than B's 16
+  workers — whether that margin is real needs the EC2 reps, not single
+  local runs
+- `task<N>` still exists as the ceiling override, so the EC2 C cells can
+  sweep it; with the governor in place the expectation is that the ceiling
+  no longer matters
 
 ## 3. Workloads
 

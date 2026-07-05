@@ -123,6 +123,29 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
   untouched — the fill only blocks while the producer channel is open, and
   the producer always closes it after queueing all input (§3 still holds)
 
+### 4.10 Shared concurrency governor (`ScaleOutGovernor`) and estimator fixes
+
+- **Decision**: the essential control problem — the number of parallel
+  in-flight requests against the required throughput — is the same in every
+  executor architecture, so the pool's scale-out decision was extracted
+  into `src/algo/governor.rs` and is now used by all candidates: the pools
+  grow their worker count and the task-per-request candidate grows its
+  in-flight cap (start 1, doubling, ceiling `task<N>`, default 256) under
+  identical logic (grow only when measured throughput is statistically
+  below the effective target; stop when the previous growth did not
+  demonstrably help; freeze while congested; ramp wait between steps)
+- **Bug fixes surfaced by the extraction** (both unit-tested):
+  - `Monitor::average_per_second` had a fencepost bias: the sum of all n
+    window values was divided by the (n−1) intervals spanning them, up to
+    2× overestimation on small windows. This silently degraded the
+    scale-out effectiveness comparison all along
+  - the effectiveness veto used a strict `>`; with the unbiased estimator
+    a saturated server reproduces the previous throughput exactly, and
+    exact equality must count as "growth did not help"
+- **Verification**: on DynamoDB Local at a saturating target, candidate C
+  self-tuned its cap to 4 and matched the pools' throughput without any
+  manual cap (benchmark-plan.md §2.7.2)
+
 ## 5. Groundwork for Future Design (not implemented, but direction-setting)
 
 ### 5.1 Multi-table / GSI support: vectorizing the resource

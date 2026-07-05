@@ -151,7 +151,16 @@ where
 
         let since = self.observations.back().unwrap(); // always safe
         let latest = self.observations.front().unwrap(); // always safe
-        let sum: f64 = self.observations.iter().map(|v| v.data.into()).sum();
+                                                         // The oldest observation only defines when the window starts; its
+                                                         // value did not arrive within the window. Counting it too would
+                                                         // inflate the rate by n/(n-1) (2x for the smallest window), which
+                                                         // destabilizes the scale-out governor's throughput comparisons.
+        let sum: f64 = self
+            .observations
+            .iter()
+            .take(self.observations.len() - 1)
+            .map(|v| v.data.into())
+            .sum();
         if since == latest {
             None
         } else {
@@ -188,6 +197,15 @@ mod tests {
 
     const DELTA: f64 = 0.000001;
 
+    // NOTE (2026-07-05): the expectations were rewritten when the fencepost
+    // bug in average_per_second was fixed. The old estimator divided the sum
+    // of ALL n window values by the (n-1) intervals spanning them, inflating
+    // the rate by n/(n-1) — 2x for the smallest window. The inflated,
+    // phase-dependent bias made the scale-out governor's effectiveness
+    // comparison unreliable (a genuine doubling of throughput could drown in
+    // the inflated variance). The estimator now excludes the oldest value:
+    // observations that arrived after the window started, divided by the
+    // window duration.
     #[test]
     fn test_monitor() {
         let (probe, mut monitor) = Monitor::new(32, 32);
@@ -201,49 +219,54 @@ mod tests {
         assert_eq!(monitor.avg(), None);
         assert_eq!(monitor.std_dev(), None);
 
+        // 10 units arrived in the 0.5s since the window started: 20/s.
         let second_observation = first_observation.add(Duration::from_millis(500));
         probe
             .add_observation_with_time(10, second_observation)
             .expect("failed to insert observation");
         monitor.consume_available_data_points_and_update_metrics();
         assert!(!monitor.metric_less_than_statistically(40.0, 1.0));
-        assert_eq!(monitor.avg(), Some(44.0));
+        assert_eq!(monitor.avg(), Some(20.0));
         assert_eq!(monitor.std_dev(), None);
 
+        // 20 more units over 1.0s: still exactly 20/s; the deviation is zero,
+        // so the metric is now statistically below the 40/s target.
         let third_observation = first_observation.add(Duration::from_millis(1000));
         probe
             .add_observation_with_time(10, third_observation)
             .expect("failed to insert observation");
         monitor.consume_available_data_points_and_update_metrics();
-        assert!(!monitor.metric_less_than_statistically(40.0, 1.0));
-        assert_eq!(monitor.avg(), Some(38.0));
-        assert_delta!(monitor.std_dev().unwrap(), 8.485281374, DELTA);
+        assert!(monitor.metric_less_than_statistically(40.0, 1.0));
+        assert_eq!(monitor.avg(), Some(20.0));
+        assert_delta!(monitor.std_dev().unwrap(), 0.0, DELTA);
 
+        // A steady 20/s stream stays at 20/s with zero deviation.
         let forth_observation = first_observation.add(Duration::from_millis(1500));
         probe
             .add_observation_with_time(10, forth_observation)
             .expect("failed to insert observation");
         monitor.consume_available_data_points_and_update_metrics();
-        assert!(!monitor.metric_less_than_statistically(40.0, 1.0));
-        assert_delta!(monitor.avg().unwrap(), 34.66666667, DELTA);
-        assert_delta!(monitor.std_dev().unwrap(), 8.326663998, DELTA);
-
-        let fifth_observation = first_observation.add(Duration::from_millis(2000));
-        probe
-            .add_observation_with_time(10, fifth_observation)
-            .expect("failed to insert observation");
-        monitor.consume_available_data_points_and_update_metrics();
-        assert!(!monitor.metric_less_than_statistically(40.0, 1.0));
-        assert_delta!(monitor.avg().unwrap(), 32.5, DELTA);
-        assert_delta!(monitor.std_dev().unwrap(), 8.062257748, DELTA);
-
-        let sixth_observation = first_observation.add(Duration::from_millis(2500));
-        probe
-            .add_observation_with_time(10, sixth_observation)
-            .expect("failed to insert observation");
-        monitor.consume_available_data_points_and_update_metrics();
         assert!(monitor.metric_less_than_statistically(40.0, 1.0));
-        assert_delta!(monitor.avg().unwrap(), 30.96, DELTA);
-        assert_delta!(monitor.std_dev().unwrap(), 7.785114, DELTA);
+        assert_eq!(monitor.avg(), Some(20.0));
+        assert_delta!(monitor.std_dev().unwrap(), 0.0, DELTA);
+
+        // The metric is not below a target it actually meets.
+        assert!(!monitor.metric_less_than_statistically(19.0, 1.0));
+    }
+
+    #[test]
+    fn test_average_per_second_has_no_small_window_bias() {
+        // 1.0 every 100ms is 10/s; the estimate must say so already for the
+        // smallest window instead of the fencepost-inflated 20/s.
+        let (probe, mut monitor) = Monitor::new(32, 32);
+        let t0 = Instant::now();
+        probe
+            .add_observation_with_time(1.0, t0)
+            .expect("failed to insert observation");
+        probe
+            .add_observation_with_time(1.0, t0.add(Duration::from_millis(100)))
+            .expect("failed to insert observation");
+        monitor.consume_available_data_points_and_update_metrics();
+        assert_delta!(monitor.avg().unwrap(), 10.0, DELTA);
     }
 }

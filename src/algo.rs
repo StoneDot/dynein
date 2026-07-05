@@ -1,6 +1,7 @@
 mod bucket;
 pub mod congestion;
 pub mod executor;
+mod governor;
 mod monitor;
 pub mod mpmc;
 #[cfg(test)]

@@ -15,9 +15,9 @@
  */
 use crate::algo::bucket::Bucket;
 use crate::algo::congestion::{AimdController, BoostSlot, CongestionStats, TargetGauge};
-use crate::algo::monitor::{Monitor, Probe};
+use crate::algo::governor::ScaleOutGovernor;
+use crate::algo::monitor::Probe;
 use futures::future::join_all;
-use itertools::Itertools;
 use log::{debug, error, info, trace};
 use rand::random;
 use std::fmt::Debug;
@@ -138,11 +138,6 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledWor
     }
 }
 
-pub(crate) struct StatDataPoint {
-    pub(crate) avg: f64,
-    pub(crate) std_dev: f64,
-}
-
 pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
     /// This channel gets a task to proceed with resource constraint
     recv: Receiver<T>,
@@ -154,12 +149,9 @@ pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
     notifier: Arc<tokio::sync::Notify>,
     /// Target resource consumption
     target_limit: f64,
-    /// A monitor of resource consumption
-    monitor: Monitor<f64>,
+    /// Decides when the worker count should grow
+    governor: ScaleOutGovernor,
     probe: Probe<f64>,
-    latest_scale_out: Instant,
-    achieved_throughput: Vec<(usize, StatDataPoint)>,
-    prev_throughput_idx: usize,
     /// Throttling counters shared with the workers
     congestion_stats: Arc<CongestionStats>,
     /// AIMD controller deciding the effective target based on throttling
@@ -181,18 +173,7 @@ pub struct ThrottledExecutor<T: ResourceConstraintProcess + Clone> {
 // unless latency is too high.
 pub(crate) const MINIMUM_WORKER_TARGET_LIMIT: f64 = 1.0;
 
-pub(crate) const NUM_MONITORING_OBSERVATIONS: usize = 256;
-pub(crate) const NUM_STATS_OBSERVATIONS: usize = 256;
-
-pub(crate) const MAX_CLIENT_GENERATION_PER_SECOND: f64 = 10.0;
-
 pub(crate) const DEFAULT_MAX_CONCURRENT_CONNECTION: usize = 1024;
-
-pub(crate) const SIGMA: f64 = 3.0;
-
-pub(crate) const SIGMA_CROSS_AVG: f64 = 2.0;
-
-pub(crate) const SCALE_WAIT_FACTOR: f64 = 3.0;
 
 impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExecutor<T> {
     /// Creates an executor. `target_limit` is the user-specified ceiling of the
@@ -208,7 +189,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
         queue_depth: usize,
     ) -> ThrottledExecutor<T> {
         assert!(queue_depth >= 1);
-        let (probe, monitor) = Monitor::new(NUM_MONITORING_OBSERVATIONS, NUM_STATS_OBSERVATIONS);
+        let governor = ScaleOutGovernor::new();
+        let probe = governor.probe();
         let min_target = MINIMUM_WORKER_TARGET_LIMIT.min(target_limit);
         let mut initial = ThrottledExecutor {
             recv,
@@ -216,11 +198,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             workers_handle: vec![],
             notifier: Arc::new(tokio::sync::Notify::new()),
             target_limit,
-            monitor,
+            governor,
             probe,
-            latest_scale_out: Instant::now(),
-            achieved_throughput: Vec::new(),
-            prev_throughput_idx: usize::MAX,
             congestion_stats: Arc::new(CongestionStats::default()),
             congestion: AimdController::with_initial_target(
                 target_limit,
@@ -281,7 +260,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
 
     fn create_worker(&mut self, target_total_worker_num: usize) {
         let target_limit = self.congestion.effective_target() / target_total_worker_num as f64;
-        let jitter_sec = random::<f64>() * self.jitter_max_secs(target_total_worker_num);
+        let jitter_sec =
+            random::<f64>() * ScaleOutGovernor::jitter_max_secs(target_total_worker_num);
         let (tx, rx) = channel::<Signal<T>>(self.queue_depth);
         let bucket = Bucket::new(target_limit, target_limit);
         let worker = ThrottledWorker::new(
@@ -391,18 +371,6 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             .min(f64::floor(self.target_limit / MINIMUM_WORKER_TARGET_LIMIT) as usize)
     }
 
-    fn jitter_max_secs(&self, target_total_worker_num: usize) -> f64 {
-        f64::min(
-            1.0,
-            target_total_worker_num as f64 / MAX_CLIENT_GENERATION_PER_SECOND,
-        )
-    }
-
-    fn elapsed_enough_time_to_scale(&self) -> bool {
-        self.latest_scale_out.elapsed()
-            >= Duration::from_secs_f64(SCALE_WAIT_FACTOR * self.jitter_max_secs(self.num_workers()))
-    }
-
     /// Feeds throttling observations into the AIMD controller, applies any
     /// pending informed jump from the slow control loop, and distributes the
     /// new per-worker rate when the effective target changes.
@@ -452,40 +420,12 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
     }
 
     async fn scale_out_if_needed(&mut self) {
-        // While throttling has been observed recently, the target is lowered on
-        // purpose; adding workers would push in the wrong direction.
-        if self.congestion.is_congested(Instant::now()) {
-            return;
-        }
-
-        // Wait ramp up time to scale resource consumption
-        if !self.elapsed_enough_time_to_scale() {
-            return;
-        }
-
-        // Update monitored metrics based on recent data points
-        self.monitor
-            .consume_available_data_points_and_update_metrics();
-
-        // Evaluate whether scale out is effective to increase resource consumption
-        if let (Some(avg), Some(std_dev)) = (self.monitor.avg(), self.monitor.std_dev()) {
-            if self.prev_throughput_idx != usize::MAX {
-                let prev_throughput = &self.achieved_throughput[self.prev_throughput_idx].1;
-                if prev_throughput.avg + prev_throughput.std_dev * SIGMA_CROSS_AVG
-                    > avg - std_dev * SIGMA_CROSS_AVG
-                {
-                    // skip scale out decision because previous scale did not have enough effect
-                    return;
-                }
-            }
-        }
-
-        // Scale out if resource consumption is not enough
-        if self
-            .monitor
-            .metric_less_than_statistically(self.congestion.effective_target(), SIGMA)
-            && self.workers_tx.len() < self.max_workers()
-        {
+        if self.governor.should_grow(
+            self.workers_tx.len(),
+            self.max_workers(),
+            self.congestion.effective_target(),
+            self.congestion.is_congested(Instant::now()),
+        ) {
             self.scale_out(self.workers_tx.len()).await;
         }
     }
@@ -520,26 +460,9 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
             self.create_worker(total_size);
         }
 
-        // Update scale out time
-        self.latest_scale_out = Instant::now();
-
-        // Memorize current throughput
-        if let (Some(avg), Some(std_dev)) = (self.monitor.avg(), self.monitor.std_dev()) {
-            self.achieved_throughput
-                .push((original_size, StatDataPoint { avg, std_dev }));
-            self.achieved_throughput
-                .sort_unstable_by(|l, r| l.0.cmp(&r.0));
-            // The below unwrap is always safe because the element inserted in this block
-            self.prev_throughput_idx = self
-                .achieved_throughput
-                .iter()
-                .find_position(|x| x.0 == original_size)
-                .unwrap()
-                .0;
-        }
-
-        // Clear current data points
-        self.monitor.clear_data_points();
+        // Memorize the throughput achieved before this growth and restart
+        // the observation window.
+        self.governor.record_growth(original_size);
 
         info!("Scaled out from {} to {}", original_size, total_size)
     }
@@ -548,6 +471,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> ThrottledExe
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::algo::monitor::Monitor;
     use tokio::sync::mpsc::channel;
 
     macro_rules! assert_timing {

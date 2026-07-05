@@ -26,14 +26,12 @@
 use crate::algo::bucket::Bucket;
 use crate::algo::congestion::{AimdController, BoostSlot, CongestionStats, TargetGauge};
 use crate::algo::executor::ExecutorError;
-use crate::algo::monitor::{Monitor, Probe};
+use crate::algo::governor::ScaleOutGovernor;
+use crate::algo::monitor::Probe;
 use crate::algo::worker::{
-    ResourceConstraintProcess, StatDataPoint, DEFAULT_MAX_CONCURRENT_CONNECTION,
-    MAX_CLIENT_GENERATION_PER_SECOND, MINIMUM_WORKER_TARGET_LIMIT, NUM_MONITORING_OBSERVATIONS,
-    NUM_STATS_OBSERVATIONS, SCALE_WAIT_FACTOR, SIGMA, SIGMA_CROSS_AVG,
+    ResourceConstraintProcess, DEFAULT_MAX_CONCURRENT_CONNECTION, MINIMUM_WORKER_TARGET_LIMIT,
 };
 use futures::future::join_all;
-use itertools::Itertools;
 use log::{debug, info};
 use rand::random;
 use std::fmt::Debug;
@@ -123,12 +121,9 @@ pub struct MpmcExecutor<T: ResourceConstraintProcess + Clone> {
     workers_handle: Vec<JoinHandle<()>>,
     /// Target resource consumption
     target_limit: f64,
-    /// A monitor of resource consumption
-    monitor: Monitor<f64>,
+    /// Decides when the worker count should grow
+    governor: ScaleOutGovernor,
     probe: Probe<f64>,
-    latest_scale_out: Instant,
-    achieved_throughput: Vec<(usize, StatDataPoint)>,
-    prev_throughput_idx: usize,
     /// Throttling counters shared with the workers
     congestion_stats: Arc<CongestionStats>,
     /// AIMD controller deciding the effective target based on throttling
@@ -160,7 +155,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> MpmcExecutor
         initial_workers: usize,
     ) -> Self {
         assert!(initial_workers >= 1);
-        let (probe, monitor) = Monitor::new(NUM_MONITORING_OBSERVATIONS, NUM_STATS_OBSERVATIONS);
+        let governor = ScaleOutGovernor::new();
+        let probe = governor.probe();
         let (shared_tx, shared_rx) = async_channel::bounded(SHARED_QUEUE_CAPACITY);
         let min_target = MINIMUM_WORKER_TARGET_LIMIT.min(target_limit);
         let congestion = AimdController::with_initial_target(
@@ -181,11 +177,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> MpmcExecutor
             workers_ctrl: vec![],
             workers_handle: vec![],
             target_limit,
-            monitor,
+            governor,
             probe,
-            latest_scale_out: Instant::now(),
-            achieved_throughput: Vec::new(),
-            prev_throughput_idx: usize::MAX,
             congestion_stats: Arc::new(CongestionStats::default()),
             congestion,
             seen_requests: 0,
@@ -206,7 +199,8 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> MpmcExecutor
 
     fn create_worker(&mut self, target_total_worker_num: usize) {
         let target_limit = self.congestion.effective_target() / target_total_worker_num as f64;
-        let jitter_sec = random::<f64>() * self.jitter_max_secs(target_total_worker_num);
+        let jitter_sec =
+            random::<f64>() * ScaleOutGovernor::jitter_max_secs(target_total_worker_num);
         let (ctrl_tx, ctrl_rx) = channel::<MpmcSignal>(4);
         let bucket = Bucket::new(target_limit, target_limit);
         let worker = MpmcWorker {
@@ -227,18 +221,6 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> MpmcExecutor
     fn max_workers(&self) -> usize {
         DEFAULT_MAX_CONCURRENT_CONNECTION
             .min(f64::floor(self.target_limit / MINIMUM_WORKER_TARGET_LIMIT) as usize)
-    }
-
-    fn jitter_max_secs(&self, target_total_worker_num: usize) -> f64 {
-        f64::min(
-            1.0,
-            target_total_worker_num as f64 / MAX_CLIENT_GENERATION_PER_SECOND,
-        )
-    }
-
-    fn elapsed_enough_time_to_scale(&self) -> bool {
-        self.latest_scale_out.elapsed()
-            >= Duration::from_secs_f64(SCALE_WAIT_FACTOR * self.jitter_max_secs(self.num_workers()))
     }
 
     /// Broadcasts a new per-worker rate to all existing workers.
@@ -294,40 +276,12 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> MpmcExecutor
     }
 
     async fn scale_out_if_needed(&mut self) {
-        // While throttling has been observed recently, the target is lowered on
-        // purpose; adding workers would push in the wrong direction.
-        if self.congestion.is_congested(Instant::now()) {
-            return;
-        }
-
-        // Wait ramp up time to scale resource consumption
-        if !self.elapsed_enough_time_to_scale() {
-            return;
-        }
-
-        // Update monitored metrics based on recent data points
-        self.monitor
-            .consume_available_data_points_and_update_metrics();
-
-        // Evaluate whether scale out is effective to increase resource consumption
-        if let (Some(avg), Some(std_dev)) = (self.monitor.avg(), self.monitor.std_dev()) {
-            if self.prev_throughput_idx != usize::MAX {
-                let prev_throughput = &self.achieved_throughput[self.prev_throughput_idx].1;
-                if prev_throughput.avg + prev_throughput.std_dev * SIGMA_CROSS_AVG
-                    > avg - std_dev * SIGMA_CROSS_AVG
-                {
-                    // skip scale out decision because previous scale did not have enough effect
-                    return;
-                }
-            }
-        }
-
-        // Scale out if resource consumption is not enough
-        if self
-            .monitor
-            .metric_less_than_statistically(self.congestion.effective_target(), SIGMA)
-            && self.workers_ctrl.len() < self.max_workers()
-        {
+        if self.governor.should_grow(
+            self.workers_ctrl.len(),
+            self.max_workers(),
+            self.congestion.effective_target(),
+            self.congestion.is_congested(Instant::now()),
+        ) {
             self.scale_out(self.workers_ctrl.len()).await;
         }
     }
@@ -355,26 +309,9 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> MpmcExecutor
             self.create_worker(total_size);
         }
 
-        // Update scale out time
-        self.latest_scale_out = Instant::now();
-
-        // Memorize current throughput
-        if let (Some(avg), Some(std_dev)) = (self.monitor.avg(), self.monitor.std_dev()) {
-            self.achieved_throughput
-                .push((original_size, StatDataPoint { avg, std_dev }));
-            self.achieved_throughput
-                .sort_unstable_by(|l, r| l.0.cmp(&r.0));
-            // The below unwrap is always safe because the element inserted in this block
-            self.prev_throughput_idx = self
-                .achieved_throughput
-                .iter()
-                .find_position(|x| x.0 == original_size)
-                .unwrap()
-                .0;
-        }
-
-        // Clear current data points
-        self.monitor.clear_data_points();
+        // Memorize the throughput achieved before this growth and restart
+        // the observation window.
+        self.governor.record_growth(original_size);
 
         info!("Scaled out from {} to {}", original_size, total_size)
     }
