@@ -15,7 +15,8 @@
  */
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// Multiplicative decrease factor applied to the effective target when
 /// congestion (throttling) is detected.

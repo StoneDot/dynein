@@ -23,10 +23,11 @@ use rand::random;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum Signal<T>

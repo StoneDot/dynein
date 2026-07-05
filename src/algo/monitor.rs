@@ -15,8 +15,8 @@
  */
 
 use std::collections::VecDeque;
-use std::time::Instant;
 use tokio::sync::mpsc::error::SendError;
+use tokio::time::Instant;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DataPoint<T> {
