@@ -57,6 +57,7 @@ Run `stage_watch.sh` (or equivalent) and evaluate:
 | Progress flat across 2 checks but heartbeat fresh | SSM into the instance, inspect runner journal before the deadline fires |
 | Progress advancing with failures (spot-check finds exit≠0) | Abort early — a full run of failed reps costs the same as a good one |
 | Heartbeat missing/stale | Let the watchdog act (it will); verify it did; if it didn't, manual abort |
+| Watchdog logs `AUTH FAILURE` | he51's AWS credentials died. Nobody off-instance can see OR abort until re-login (`setsid nohup aws sso login --no-browser` + hand the URL to the user; if unreachable, the on-instance layer — instance-profile creds never expire — plus the 9h boot-level `shutdown +540` remain the backstop). Watchdog freezes completion/abort decisions and retries; never treat its silence as success |
 | Manual abort needed | `sweep.sh` order: tables → salvage → stop instances (postmortem §8: money, evidence, compute, human) |
 
 ## 4. Cadence and mechanics
