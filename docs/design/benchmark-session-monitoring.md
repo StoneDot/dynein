@@ -77,3 +77,18 @@ Run `stage_watch.sh` (or equivalent) and evaluate:
     keyed by the literal string, and a short SHA fails the gate lookup.
   - Long-lived waiters must be `setsid nohup … &` detached; plain
     background jobs die with the session turn.
+
+## 5. Fourth layer: cloud-side orphan reaper
+
+`scripts/bench/setup_reaper.sh` deploys an EventBridge rule (rate 15 min) →
+Lambda that deletes any us-west-2 table which is `dynein-bench-` prefixed,
+carries the `dynein-bench` tag, is ACTIVE, and is older than TTL (90 min;
+legit fresh-per-rep tables live ≤ ~25 min). This is the only layer that
+survives the dev machine, the session agent, the watchdog and the fleet all
+dying together — it bounds the orphan-table cost to ~TTL/60 × $25 at 39k WCU.
+
+- **Raise the TTL or disable the rule before using the reuse-fallback
+  strategy** (commit 8f4cdc5's ~4h shared table would be reaped mid-run).
+- Deletion-path testing (dummy table + TTL=0) only in a no-live-tables
+  window — with the schedule enabled, a lowered TTL races against live runs.
+- Teardown after Tier-1: `setup_reaper.sh --teardown`.
