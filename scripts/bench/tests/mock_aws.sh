@@ -18,6 +18,21 @@ set -uo pipefail
 echo "$*" >> "$MOCK_DIR/calls.log"
 
 args=("$@")
+
+# fail_auth_after: once the tick counter (advanced by list-tables) reaches
+# this value, EVERY call fails like an expired SSO token — the failure mode
+# where a watchdog must not mistake "cannot see" for "nothing exists".
+auth_dead() {
+    local limit tick
+    limit=$(cat "$MOCK_DIR/fail_auth_after" 2>/dev/null) || return 1
+    tick=$(cat "$MOCK_DIR/.tick" 2>/dev/null || echo 0)
+    [ "$tick" -ge "$limit" ]
+}
+if auth_dead; then
+    echo "An error occurred (ExpiredTokenException): The security token included in the request is expired" >&2
+    exit 255
+fi
+
 has() { local w; for w in "${args[@]}"; do [ "$w" = "$1" ] && return 0; done; return 1; }
 arg_after() {  # value following the given flag
     local i
@@ -95,6 +110,8 @@ case "$1 $2" in
     ;;
 "ssm send-command")
     : ;;
+"sts get-caller-identity")
+    : ;;  # auth probe: success unless auth_dead already failed above
 *)
     echo "mock_aws: unhandled: $*" >&2
     exit 1

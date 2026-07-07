@@ -196,11 +196,32 @@ SPENT_USD=0
 WATCH_STARTED=$(date +%s)
 TICK=0
 SAW_ACTIVITY=0
+AUTH_FAILS=0
+
+creds_ok() { $AWS sts get-caller-identity >/dev/null 2>&1; }
 
 log "watching run $RUN_ID (budget \$$BUDGET_USD, stall ${STALL_MINUTES}x${INTERVAL}s @ <$STALL_THRESHOLD, heartbeat max age ${HEARTBEAT_MAX_AGE}s)"
 
 while :; do
     TICK=$((TICK + 1))
+
+    # -- 0. credential probe. An expired token makes every AWS call fail
+    #    with empty output — indistinguishable from "no resources", which
+    #    would otherwise satisfy the completion condition and retire the
+    #    guardian while tables may still be billing. Treat "cannot see" as
+    #    an alarm state: no spend integration, no completion, no abort
+    #    decisions; retry loudly until sight returns.
+    if ! creds_ok; then
+        AUTH_FAILS=$((AUTH_FAILS + 1))
+        log "ERROR AUTH FAILURE (consecutive: $AUTH_FAILS): cannot query AWS — resources may still exist and bill; refusing completion/abort decisions until credentials return. Re-login: setsid nohup aws sso login --no-browser"
+        if [ "$MAX_TICKS" -gt 0 ] && [ "$TICK" -ge "$MAX_TICKS" ]; then
+            log "max ticks reached; exiting (no abort condition met)"
+            exit 0
+        fi
+        sleep "$INTERVAL"
+        continue
+    fi
+    AUTH_FAILS=0
 
     # -- inventory
     TABLES=$(run_tables)
@@ -281,8 +302,16 @@ while :; do
     # moments before the fleet appears must not mistake "not yet" for "done".
     NOT_DONE=$(run_instances "pending,running,stopping,stopped")
     if [ "$SAW_ACTIVITY" = "1" ] && [ -z "$TABLES" ] && [ -z "$NOT_DONE" ]; then
-        log "run finished: no tables, no live instances (integrated spend ~\$$SPENT_USD)"
-        exit 0
+        # Completion retires the guardian — re-probe credentials first so a
+        # token that expired mid-tick (after the top-of-loop probe) cannot
+        # make "cannot see anything" pass for "nothing left".
+        if ! creds_ok; then
+            AUTH_FAILS=$((AUTH_FAILS + 1))
+            log "ERROR AUTH FAILURE at completion check: empty inventory is untrustworthy; refusing to declare completion"
+        else
+            log "run finished: no tables, no live instances (integrated spend ~\$$SPENT_USD)"
+            exit 0
+        fi
     fi
 
     log "tick $TICK: tables=$(printf '%s' "$TABLES" | grep -c . || true) wcu=$TOTAL_WCU running=$(printf '%s' "$RUNNING" | grep -c . || true) spent=~\$$SPENT_USD"

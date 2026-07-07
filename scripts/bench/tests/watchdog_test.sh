@@ -133,6 +133,28 @@ check "stale-heartbeat: reason mentions the heartbeat" \
     grep -q "heartbeat" "$MOCK_DIR/watchdog.log"
 rm -rf "$MOCK_DIR"
 
+# ============ scenario 6: expired credentials != completed run ===============
+# An expired SSO token makes every AWS call fail with empty output. The
+# watchdog must treat "cannot see" as an alarm state — never as "no tables,
+# no instances, therefore finished" (which would retire the guardian while
+# resources may still be billing), and never as grounds for blind abort.
+fresh_scenario
+printf 'dynein-bench-testrun-task-w39000-large-1\t39000\n' > "$MOCK_DIR/tables.tsv"
+printf 'i-authdead1\n' > "$MOCK_DIR/instances.txt"
+echo "540" > "$MOCK_DIR/cw_rate"
+mkdir -p "$MOCK_DIR/heartbeat"
+python3 -c 'import json,time; print(json.dumps({"ts": int(time.time()), "cell": "task-w39000-large", "cell_started": int(time.time())-60, "phase": "import"}))' \
+    > "$MOCK_DIR/heartbeat/m9g.xlarge-s0.json"
+echo "3" > "$MOCK_DIR/fail_auth_after"  # healthy first, then the token dies
+run_watchdog --budget-usd 1000 --max-ticks 8; rc=$?
+check "auth-fail: does NOT report the run finished" \
+    bash -c '! grep -q "run finished" "$MOCK_DIR/watchdog.log"'
+check "auth-fail: logs AUTH FAILURE loudly" \
+    grep -q "AUTH FAILURE" "$MOCK_DIR/watchdog.log"
+check "auth-fail: takes no blind abort actions" \
+    bash -c '! grep -qE "delete-table|stop-instances" "$MOCK_DIR/calls.log"'
+rm -rf "$MOCK_DIR"
+
 echo
 if [ "$FAILURES" = "0" ]; then
     echo "WATCHDOG SELF-TEST PASSED"
