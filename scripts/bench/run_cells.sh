@@ -3,17 +3,17 @@
 #
 # Reads config.json (schema: see scripts/bench/README.md), selects the cells
 # assigned to this shard, and for each cell x repetition:
-#   1. creates a provisioned table. Cheap tables (< REUSE_WCU_THRESHOLD) are
-#      fresh per rep (burst capacity reset, import-throttling.md §6);
-#      expensive tables are created once per (wcu, shard) and reused across
-#      cells because DynamoDB bills provisioned capacity at hourly
-#      granularity and the docs do not promise sub-hour proration for
-#      deleted tables — 24 short-lived 39k-WCU tables could bill up to 24
-#      table-hours, one reused table bills its actual wall-clock hours.
-#      Reuse is safe for Tier-1: with the initial target at 80% of the
-#      provisioned WCU and no co-located writer these cells never throttle,
-#      so burst-capacity reset is irrelevant (item overwrites consume the
-#      same WCU as fresh puts)
+#   1. creates a provisioned table, fresh per rep (burst capacity reset,
+#      import-throttling.md §6, plus no cross-rep partition-heat carryover).
+#      Measured billing behavior (benchmark-plan.md §8, 2026-07-07):
+#      provisioned capacity bills only COMPLETE clock hours of table
+#      existence — partial hours are dropped, not rounded up — so a
+#      sub-60-minute per-rep table bills nothing, while a table reused
+#      across cells lives for hours and accrues real charge. Fresh-per-rep
+#      is therefore both the cheapest and the best-isolated strategy.
+#      The reuse branch below is retained but disabled (threshold sentinel);
+#      if billing ever contradicts the measured model, launch from commit
+#      8f4cdc5 (its canary PASS marker covers the reuse strategy)
 #   2. generates the input file with gen_input.py (deterministic seed)
 #   3. optionally starts the pseudo production writer
 #   4. runs `dy import` under /usr/bin/time -v + perf record (if available)
@@ -54,9 +54,11 @@ COMMIT_SHA="$(cfg commit_sha)"
 
 S3_PREFIX="s3://$BUCKET/runs/$RUN_ID/results/$INSTANCE_TYPE"
 
-# Tables provisioned at or above this WCU are created once and reused across
-# cells (see the billing note in the header).
-REUSE_WCU_THRESHOLD=1000
+# Sentinel: table reuse is disabled — every rep gets a fresh table (billing
+# note in the header: partial clock hours are unbilled, so short-lived
+# fresh tables are free while reused ones accrue complete hours). Lower this
+# back to e.g. 1000 only if the measured billing model is contradicted.
+REUSE_WCU_THRESHOLD=999999999
 
 log() { printf '[run_cells] %s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
@@ -205,9 +207,9 @@ import json, sys, zlib, math
 cfg = json.load(open(sys.argv[1]))
 shard = int(sys.argv[2])
 AVG_WCU = {"uniform-small": 1.0, "mixed": 2.9, "uniform-large": 35.0}
-# Run cheap cells first and expensive cells last, contiguously: high-WCU
-# tables are reused across cells (billing note in the header), and grouping
-# them keeps the reused table's lifetime — and its billed hours — minimal.
+# Run cheap cells first and expensive cells last. With fresh-per-rep tables
+# the ordering no longer affects billing (header note); it is kept so the
+# cheap smoke cells still fail fast before any high-WCU capacity exists.
 ordered = sorted(
     (c for c in cfg["cells"] if int(c.get("shard", 0)) == shard),
     key=lambda c: c["wcu"],
@@ -406,9 +408,8 @@ print(json.dumps({
 }, indent=2))
 PYEOF
 
-    # 6. Upload artifacts, then drop the table. Reused tables stay for the
-    #    following cells and are removed by the exit cleanup (deleting and
-    #    recreating them would multiply the billed table-hours).
+    # 6. Upload artifacts, then drop the table. (If the disabled reuse branch
+    #    is ever re-enabled, reused tables are removed by the exit cleanup.)
     set_phase "$cell_id" "$rep" "upload" "$cell_started"
     aws s3 cp --recursive "$dir" "$S3_PREFIX/$cell_id/rep$rep/" >/dev/null
     if [ "$reuse" = "0" ]; then
