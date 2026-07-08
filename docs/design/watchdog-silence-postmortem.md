@@ -113,8 +113,34 @@ is a definitive stall signal.
 
 **Implementation: stats-based** (read `DYNEIN_BENCH_STATS`, not a new
 file). The stats emitter (`DYNEIN_BENCH_STATS=<path>`) already writes
-per-second JSONL with `total_requests`. The heartbeat loop reads the last
-line and includes it in the upload. No dy binary changes needed.
+per-second JSONL; the progress counter is its **`resolved_items`** field
+(complete + failed items — the same quantity dy's own in-process
+`StallDetector` watches, so the two share semantics). The heartbeat loop
+(`run_cells.sh`) reads the last stats line for the current cell/rep and
+attaches `resolved_items` as `progress`. No dy binary changes needed.
+(An earlier draft named the field `total_requests`; the emitter has no
+such field, and `requests` advances on retries even when nothing resolves,
+so `resolved_items` is the correct "work completed" signal.)
+
+**Threshold — must fire LATER than dy's in-process StallDetector, not
+earlier.** dy already aborts a stalled import in-process at
+`STALL_DEADLINE = 300s` of frozen `resolved_items` (`transfer.rs`), and
+that abort has a *single-cell* blast radius: the rep fails, the runner
+moves on. F2 → `abort_run` kills the *whole run*. So F2 must not preempt
+dy's own narrow recovery — it is a backstop for the case dy's recovery
+*itself* wedges. That is precisely what happened in run 152019: the
+monitoring task detected the stall and fired at ~300s, but its remediation
+(`executor_handle.await` after `terminate`) never returns while the pool1
+dispatcher is deadlocked, so the process hung — fresh heartbeat, zero WCU —
+until the in-process `timeout` SIGKILLed it at budget×2 = 1400s. Recovery
+detected, recovery could not execute.
+
+Therefore `--progress-frozen-strikes` defaults to **6** (360s at the 60s
+interval), safely past the 300s in-process window: for a *recoverable*
+stall dy exits/advances the cell before strike 6 and F2 resets; only a
+*wedged* recovery (phase stuck at `import`, progress frozen past 300s)
+reaches the strike limit and trips the whole-run abort — turning a
+1400s-until-SIGKILL wait into a ~360s watchdog abort.
 
 The concern about "stats loop coupled to the async runtime" is overblown
 for the actual failure modes:
@@ -147,21 +173,30 @@ expected and must not trigger strikes.
 | T+700..1400s | dy is wedged, 0 WCU consumed | **stall**: skipped (w10 < 1000) |
 | | | **heartbeat**: fresh every 60s (loop is independent) |
 | | | **deadline**: limit=1700s not yet reached |
+| T+1000s | in-process StallDetector fires (300s frozen), sends terminate | but `executor_handle.await` hangs on the deadlocked pool — recovery detected, cannot execute |
 | T+1400s | in-process `timeout` kills dy | exit code 124 |
 | T+1700s | external deadline would have fired | **never reached** |
 
 ## Compound failure: all three are needed simultaneously
 
-With the proposed fixes, detection would improve as follows:
-- F1 (zero-consumption stall on all tables): detected at T+700s + 5 ticks
-  = ~T+1000s
-- F2 (progress-frozen heartbeat, phase-aware): detected at T+700s + 3
-  ticks = ~T+880s — even earlier, catches wedges regardless of WCU
+With the fixes, detection/abort would improve as follows:
+- F1 (zero-consumption stall on all tables): strikes from ~T+760s (CloudWatch
+  lag) and aborts at 5 consecutive checks ≈ T+1060s.
+- F2 (progress-frozen heartbeat, phase-aware): strikes from stall onset and
+  aborts at 6 consecutive import checks ≈ T+1060s. This is deliberately
+  *not* earlier than dy's 300s in-process StallDetector (which fires ≈T+1000s
+  but cannot execute its recovery here) — F2's whole-run abort must stay a
+  backstop for wedged recovery, never a preemption of dy's single-cell abort.
+
+Either way the run is aborted around T+1060s instead of hanging to the
+T+1400s SIGKILL — and, more importantly, the same signals would catch a wedge
+on an *expensive* table where the intervening minutes actually bill.
 
 F1 and F2 are complementary: F1 catches stalls via CloudWatch (external,
-works even if heartbeat upload fails), F2 catches them via the progress
-counter (faster, works even if CloudWatch has extended lag). The external
-cell deadline stays as the last-resort backstop.
+works even if heartbeat upload fails, WCU-agnostic after this fix), F2
+catches them via the progress counter (works even if CloudWatch has extended
+lag, and pinpoints the wedged instance). The external cell deadline stays as
+the last-resort backstop.
 
 The lesson is that three independent mechanisms failed simultaneously
 because they shared a common assumption: "cheap tables don't need deep
@@ -170,15 +205,24 @@ layers should have **diverse** failure modes.
 
 ## Fixes to implement
 
-| # | Fix | Priority | Scope |
+| # | Fix | Status | Scope |
 |---|---|---|---|
-| F1 | Zero-consumption stall check for all tables | High | watchdog.sh |
-| F2 | Progress counter in heartbeat (stats-based, phase-aware) | High | run_cells.sh + watchdog.sh |
-| F3 | Watchdog test scenarios for cheap-table stall + frozen progress | High | tests/ |
+| F1 | Zero-consumption stall check for all tables | **Implemented** | watchdog.sh |
+| F2 | Progress counter in heartbeat (stats-based, phase-aware) | **Implemented** | run_cells.sh + watchdog.sh |
+| F3 | Watchdog test scenarios for cheap-table stall + frozen progress | **Implemented** | tests/watchdog_test.sh |
 
-**On-instance changes**: F2 modifies run_cells.sh (heartbeat loop reads
-stats file) → requires fresh G2 canary before Tier-1 Stage 2. F1 is
-watchdog-only (off-instance), no canary needed.
+Implemented in this session (TDD: scenarios 7–10 in `tests/watchdog_test.sh`
+first, then the watchdog/runner changes until green — full suite passes).
+F1 strikes on `consumed ≤ --zero-wcu-rate` (default 0.5 WCU/s) for any table,
+keeping the `--stall-threshold`/`--expensive-wcu` fractional check for the
+high-WCU tables. F2 adds `--progress-frozen-strikes` (default 6). A
+testability seam, `WATCHDOG_SALVAGE_WAIT` (default 30s, 0 in the self-test),
+keeps the mocked suite from wall-clocking on the SSM salvage sleep.
+
+**On-instance changes**: F2 modifies run_cells.sh (heartbeat loop reads the
+per-rep `stats.jsonl` and attaches `resolved_items` as `progress`) → **requires
+a fresh G2 canary before Tier-1 Stage 2**. F1 and the F2 watchdog-side logic
+are off-instance (watchdog.sh), no canary needed on their own.
 
 ## Pool1 deadlock root cause (cross-reference)
 

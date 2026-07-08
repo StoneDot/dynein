@@ -2,10 +2,14 @@
 # Off-instance run watchdog with abort authority (postmortem §4).
 #
 # Watches HEALTH and MONEY — not liveness — and acts on its own:
-#   1. Stall: for every expensive table, CloudWatch consumed WCU must stay
-#      >= --stall-threshold x provisioned; --stall-minutes consecutive
-#      violations while the table exists trigger an abort. (Run 090552's
-#      idle 39k table would have been caught at minute 5, ~$2.)
+#   1. Stall: CloudWatch consumed WCU must show writes. Two independent
+#      violations, either of which counts a strike (--stall-minutes
+#      consecutive => abort): (a) ZERO-consumption on ANY table regardless of
+#      WCU (a wedged w10 cell is as idle as a wedged 39k one — run 090552's
+#      idle 39k table AND run 152019's wedged w10 cell would both be caught);
+#      (b) for expensive tables only, consumption < --stall-threshold x
+#      provisioned (fractional-target detection is unreliable below the
+#      CloudWatch noise floor at low WCU).
 #   2. Spend ceiling: integrates table-WCU-hours at the worst-case rate and
 #      aborts when the projection (spent + one more billing hour) crosses
 #      --budget-usd. The budget is a hard ceiling, not a notification.
@@ -15,6 +19,10 @@
 #   4. External cell deadline: a heartbeat stuck in the same cell for more
 #      than 2x its budget_secs is treated as wedged (the on-instance timeout
 #      may itself be dead — that is exactly how run 090552 failed).
+#   5. Progress-frozen (F2): during phase=import the heartbeat carries a
+#      stats-derived resolved_items counter; frozen for
+#      --progress-frozen-strikes consecutive checks is a wedge even when the
+#      heartbeat itself stays fresh (run 152019's pool1 blind spot).
 #
 # Abort order (experiment-protocol §8): money first (delete the run's
 # tables), evidence second (SSM-salvage logs, stop — never terminate — the
@@ -27,7 +35,7 @@
 #   watchdog.sh --run-id ID --bucket B --region R --budget-usd N
 #       [--interval 60] [--stall-minutes 5] [--stall-threshold 0.05]
 #       [--heartbeat-max-age 300] [--boot-grace 1500] [--expensive-wcu 1000]
-#       [--max-ticks N]
+#       [--zero-wcu-rate 0.5] [--progress-frozen-strikes 6] [--max-ticks N]
 #
 # Testing: all AWS access goes through $WATCHDOG_AWS (default: aws), so a
 # mock CLI can drive every branch — see tests/watchdog_test.sh.
@@ -43,6 +51,13 @@ BOOT_GRACE=1500
 EXPENSIVE_WCU=1000
 MAX_TICKS=0   # 0 = unlimited
 WCU_RATE=0.00065  # USD per WCU-hour (us-west-2 provisioned)
+ZERO_WCU_RATE=0.5  # consumed WCU/s at or below this reads as "no writes" (F1)
+# Consecutive frozen-progress checks (phase=import) before a wedge abort (F2).
+# MUST exceed the in-process StallDetector window (STALL_DEADLINE=300s in
+# transfer.rs) divided by --interval: dy aborts a *single* stalled cell at
+# 300s, whereas this is a *whole-run* abort. Firing sooner would preempt dy's
+# own narrow-blast-radius recovery. At the default 60s interval, 6 = 360s.
+PROGRESS_FROZEN_STRIKES=6
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -56,6 +71,8 @@ while [ $# -gt 0 ]; do
         --heartbeat-max-age) HEARTBEAT_MAX_AGE="$2"; shift ;;
         --boot-grace) BOOT_GRACE="$2"; shift ;;
         --expensive-wcu) EXPENSIVE_WCU="$2"; shift ;;
+        --zero-wcu-rate) ZERO_WCU_RATE="$2"; shift ;;
+        --progress-frozen-strikes) PROGRESS_FROZEN_STRIKES="$2"; shift ;;
         --max-ticks) MAX_TICKS="$2"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -65,6 +82,10 @@ done
 : "${REGION:?--region required}" "${BUDGET_USD:?--budget-usd required (hard ceiling)}"
 
 AWS="${WATCHDOG_AWS:-aws}"
+# Seconds to let the SSM salvage command run before stopping instances. The
+# default gives RunShellScript time to upload artifacts; self-tests set it to
+# 0 so mocked SSM calls do not wall-clock the suite.
+SALVAGE_WAIT="${WATCHDOG_SALVAGE_WAIT:-30}"
 STATE_DIR=$(mktemp -d /tmp/dynein-watchdog.XXXXXX)
 trap 'rm -rf "$STATE_DIR"' EXIT
 
@@ -106,7 +127,7 @@ consumed_rate() {  # $1 = table -> consumed WCU/s over the last complete minute
         | awk '$1 == "None" || $1 == "" {print 0; next} {printf "%.2f", $1 / 60}'
 }
 
-heartbeats() {  # -> lines of "name<TAB>age_secs<TAB>cell<TAB>cell_started<TAB>phase"
+heartbeats() {  # -> "name<TAB>age<TAB>cell<TAB>cell_started<TAB>phase<TAB>progress"
     local keys k body
     keys=$($AWS s3 ls "s3://$BUCKET/runs/$RUN_ID/heartbeat/" 2>/dev/null \
         | awk '{print $NF}' | grep . || true)
@@ -117,7 +138,11 @@ import json, sys, time
 try:
     b = json.loads('''$body''')
     age = int(time.time()) - int(b.get("ts", 0))
-    print(f"{sys.argv[1]}\t{age}\t{b.get('cell','-')}\t{b.get('cell_started') or 0}\t{b.get('phase','-')}")
+    # progress is the stats-derived resolved_items counter (F2); absent
+    # outside import or before the first stats line -> "-".
+    prog = b.get("progress")
+    prog = "-" if prog is None else prog
+    print(f"{sys.argv[1]}\t{age}\t{b.get('cell','-')}\t{b.get('cell_started') or 0}\t{b.get('phase','-')}\t{prog}")
 except Exception:
     pass
 PYEOF
@@ -148,7 +173,7 @@ abort_run() {
             --document-name "AWS-RunShellScript" \
             --instance-ids $ids \
             --parameters 'commands=["aws s3 cp --recursive /opt/dynein-bench/work/artifacts s3://'"$BUCKET"'/runs/'"$RUN_ID"'/salvage/$(hostname)/ || true","aws s3 cp /var/log/dynein-bench.log s3://'"$BUCKET"'/runs/'"$RUN_ID"'/salvage/$(hostname)-boot.log || true"]' \
-            >/dev/null 2>&1 && sleep 30 || log "WARNING: SSM salvage failed"
+            >/dev/null 2>&1 && sleep "$SALVAGE_WAIT" || log "WARNING: SSM salvage failed"
         log "stopping instances: $ids"
         # shellcheck disable=SC2086
         $AWS ec2 stop-instances --region "$REGION" --instance-ids $ids \
@@ -192,6 +217,8 @@ fi
 # --- main loop -------------------------------------------------------------------
 declare -A STALL_COUNT
 declare -A HB_MISS_COUNT
+declare -A LAST_PROGRESS       # F2: last resolved_items seen per runner
+declare -A PROGRESS_FROZEN     # F2: consecutive frozen-progress strikes
 SPENT_USD=0
 WATCH_STARTED=$(date +%s)
 TICK=0
@@ -243,18 +270,29 @@ while :; do
         abort_run "spend projection \$$PROJECTED exceeds budget \$$BUDGET_USD (integrated \$$SPENT_USD, current ${TOTAL_WCU} WCU)"
     fi
 
-    # -- 1. stall detection on expensive tables ------------------------------
+    # -- 1. stall detection (F1: zero-consumption on ALL tables; threshold
+    #       only on expensive ones) ---------------------------------------------
     while IFS=$'\t' read -r table wcu; do
         [ -z "$table" ] && continue
-        if [ "$wcu" -lt "$EXPENSIVE_WCU" ]; then continue; fi
         rate=$(consumed_rate "$table")
-        low=$(awk -v r="${rate:-0}" -v w="$wcu" -v t="$STALL_THRESHOLD" \
-            'BEGIN {print (r < w * t) ? 1 : 0}')
-        if [ "$low" = "1" ]; then
+        # (a) Zero consumption is unambiguous at any WCU. A table exists only
+        #     from create -> import -> delete (pregen and create-table retries
+        #     run with no table), so no legitimate phase keeps it alive with
+        #     zero writes for STALL_MINUTES; CloudWatch's 1-2min lag is
+        #     absorbed by the strike window. No phase-awareness needed.
+        zero=$(awk -v r="${rate:-0}" -v z="$ZERO_WCU_RATE" \
+            'BEGIN {print (r <= z) ? 1 : 0}')
+        # (b) Fractional-target stall: only trustworthy above the noise floor.
+        low=0
+        if [ "$wcu" -ge "$EXPENSIVE_WCU" ]; then
+            low=$(awk -v r="${rate:-0}" -v w="$wcu" -v t="$STALL_THRESHOLD" \
+                'BEGIN {print (r < w * t) ? 1 : 0}')
+        fi
+        if [ "$zero" = "1" ] || [ "$low" = "1" ]; then
             STALL_COUNT[$table]=$(( ${STALL_COUNT[$table]:-0} + 1 ))
-            log "table $table: consumed ${rate:-0}/s < ${STALL_THRESHOLD} x ${wcu} (strike ${STALL_COUNT[$table]}/$STALL_MINUTES)"
+            log "table $table stalled: consumed ${rate:-0}/s (zero=$zero low=$low, strike ${STALL_COUNT[$table]}/$STALL_MINUTES)"
             if [ "${STALL_COUNT[$table]}" -ge "$STALL_MINUTES" ]; then
-                abort_run "expensive table $table stalled: consumption < ${STALL_THRESHOLD} x provisioned for ${STALL_MINUTES} consecutive checks"
+                abort_run "table $table stalled: consumed ${rate:-0}/s (zero-consumption or < ${STALL_THRESHOLD} x provisioned) for ${STALL_MINUTES} consecutive checks"
             fi
         else
             STALL_COUNT[$table]=0
@@ -274,7 +312,7 @@ while :; do
                     && abort_run "instances running but no heartbeat ever appeared (boot wedged?)"
             fi
         else
-            while IFS=$'\t' read -r name age cell cell_started phase; do
+            while IFS=$'\t' read -r name age cell cell_started phase progress; do
                 [ -z "$name" ] && continue
                 if [ "$age" -gt "$HEARTBEAT_MAX_AGE" ]; then
                     HB_MISS_COUNT[$name]=$(( ${HB_MISS_COUNT[$name]:-0} + 1 ))
@@ -292,6 +330,36 @@ while :; do
                     if [ "$elapsed" -gt "$limit" ]; then
                         abort_run "cell $cell on $name exceeded its external deadline (${elapsed}s > ${limit}s; phase $phase)"
                     fi
+                fi
+                # F2: progress-frozen wedge (phase-aware). A fresh heartbeat
+                # proves the runner loop is alive, not that dy is resolving
+                # items — the exact "liveness not health" blind spot that let
+                # run 152019's pool1 wedge run to the in-process timeout. The
+                # stats-derived progress counter advances only when work
+                # completes; frozen across the strike window while phase=import
+                # is a definitive wedge. Legitimately frozen during
+                # create-table/pregen/upload, hence the phase gate. The strike
+                # window exceeds dy's own 300s StallDetector so this whole-run
+                # abort only fires once dy's single-cell recovery has itself
+                # wedged (executor await hangs); see the postmortem.
+                if [ "$phase" = "import" ] && [ "$progress" != "-" ] \
+                    && [ -n "$progress" ]; then
+                    if [ -n "${LAST_PROGRESS[$name]:-}" ] \
+                        && [ "$progress" = "${LAST_PROGRESS[$name]}" ]; then
+                        PROGRESS_FROZEN[$name]=$(( ${PROGRESS_FROZEN[$name]:-0} + 1 ))
+                        log "heartbeat $name progress frozen at $progress items (phase import, strike ${PROGRESS_FROZEN[$name]}/$PROGRESS_FROZEN_STRIKES)"
+                        if [ "${PROGRESS_FROZEN[$name]}" -ge "$PROGRESS_FROZEN_STRIKES" ]; then
+                            abort_run "runner $name progress frozen at $progress items for $PROGRESS_FROZEN_STRIKES consecutive import checks (dy stall recovery wedged?)"
+                        fi
+                    else
+                        PROGRESS_FROZEN[$name]=0
+                    fi
+                    LAST_PROGRESS[$name]=$progress
+                else
+                    # New cell resets resolved_items to 0; clear so the next
+                    # import starts a fresh frozen-progress evaluation.
+                    PROGRESS_FROZEN[$name]=0
+                    unset "LAST_PROGRESS[$name]"
                 fi
             done <<< "$HB"
         fi

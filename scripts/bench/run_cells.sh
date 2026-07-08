@@ -120,13 +120,33 @@ set_phase() {
 set_phase "-" "-" "boot" ""
 heartbeat_loop() {
     while true; do
-        python3 - "$WORK_DIR/phase.json" <<'PYEOF' > "$WORK_DIR/heartbeat.json" 2>/dev/null
-import json, sys, time
+        python3 - "$WORK_DIR/phase.json" "$WORK_DIR" <<'PYEOF' > "$WORK_DIR/heartbeat.json" 2>/dev/null
+import json, os, sys, time
+work_dir = sys.argv[2]
 try:
     body = json.load(open(sys.argv[1]))
 except Exception:
     body = {"phase": "unknown"}
 body["ts"] = int(time.time())
+# F2 (watchdog-silence-postmortem.md): a fresh heartbeat proves the loop is
+# alive, not that dy is resolving items. Attach the stats-derived
+# resolved_items counter so the watchdog can detect a wedge whose heartbeat
+# stays fresh. Only meaningful mid-import — create-table/pregen/upload have
+# no active stats file; the watchdog phase-gates on this.
+if body.get("phase") == "import" and body.get("cell") not in (None, "-"):
+    stats = os.path.join(work_dir, "artifacts", str(body["cell"]),
+                         "rep" + str(body.get("rep", "")), "stats.jsonl")
+    try:
+        last = None
+        with open(stats) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    last = line
+        if last:
+            body["progress"] = int(json.loads(last).get("resolved_items", 0))
+    except Exception:
+        pass
 print(json.dumps(body))
 PYEOF
         aws s3 cp "$WORK_DIR/heartbeat.json" "$HEARTBEAT_OBJ" >/dev/null 2>&1 || true

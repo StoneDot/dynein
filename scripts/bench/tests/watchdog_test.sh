@@ -9,6 +9,7 @@ TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$(dirname "$TESTS_DIR")"
 WATCHDOG="$BENCH_DIR/watchdog.sh"
 export WATCHDOG_AWS="$TESTS_DIR/mock_aws.sh"
+export WATCHDOG_SALVAGE_WAIT=0  # don't wall-clock the suite on mocked SSM waits
 
 FAILURES=0
 check() {  # check <description> <condition...>
@@ -153,6 +154,75 @@ check "auth-fail: logs AUTH FAILURE loudly" \
     grep -q "AUTH FAILURE" "$MOCK_DIR/watchdog.log"
 check "auth-fail: takes no blind abort actions" \
     bash -c '! grep -qE "delete-table|stop-instances" "$MOCK_DIR/calls.log"'
+rm -rf "$MOCK_DIR"
+
+# ===== scenario 7: F1 zero-consumption stall on a CHEAP table aborts =========
+# Before F1 the stall detector skipped every table below EXPENSIVE_WCU, so a
+# wedged w10 cell (all of Stage 1) idled undetected. Zero consumption is
+# unambiguous at any WCU. progress advances here so ONLY F1 can abort.
+fresh_scenario
+printf 'dynein-bench-testrun-pool1-w10-mixed-1\t10\n' > "$MOCK_DIR/tables.tsv"
+printf 'i-cheap0001\n' > "$MOCK_DIR/instances.txt"
+echo "None" > "$MOCK_DIR/cw_rate"   # zero consumption on a 10-WCU table
+echo 1 > "$MOCK_DIR/progress_advancing"
+mkdir -p "$MOCK_DIR/heartbeat"
+python3 -c 'import json,time; print(json.dumps({"ts": int(time.time()), "cell": "pool1-w10-mixed", "cell_started": int(time.time())-60, "phase": "import", "progress": 500}))' \
+    > "$MOCK_DIR/heartbeat/m9g.xlarge-s0.json"
+run_watchdog --budget-usd 1000 --stall-minutes 3 --max-ticks 10; rc=$?
+check "f1-cheap-stall: exits with abort code 3" [ "$rc" = "3" ]
+check "f1-cheap-stall: reason mentions the stalled table" \
+    grep -q "stalled" "$MOCK_DIR/watchdog.log"
+check "f1-cheap-stall: cheap table was deleted" \
+    grep -q "dynamodb delete-table" "$MOCK_DIR/calls.log"
+rm -rf "$MOCK_DIR"
+
+# ===== scenario 8: F2 frozen progress during import aborts ====================
+# A fresh heartbeat proves liveness, not progress. resolved_items frozen
+# across the strike window while phase=import is a wedge the heartbeat-age
+# check cannot see. Healthy WCU (540/min = 9/s) rules out F1 — only F2 fires.
+fresh_scenario
+printf 'dynein-bench-testrun-task-w10-mixed-1\t10\n' > "$MOCK_DIR/tables.tsv"
+printf 'i-frozen001\n' > "$MOCK_DIR/instances.txt"
+echo "540" > "$MOCK_DIR/cw_rate"
+mkdir -p "$MOCK_DIR/heartbeat"
+python3 -c 'import json,time; print(json.dumps({"ts": int(time.time()), "cell": "task-w10-mixed", "cell_started": int(time.time())-60, "phase": "import", "progress": 4200}))' \
+    > "$MOCK_DIR/heartbeat/m9g.xlarge-s0.json"
+run_watchdog --budget-usd 1000 --progress-frozen-strikes 3 --max-ticks 10; rc=$?
+check "f2-frozen-import: exits with abort code 3" [ "$rc" = "3" ]
+check "f2-frozen-import: reason mentions frozen progress" \
+    grep -q "progress frozen" "$MOCK_DIR/watchdog.log"
+check "f2-frozen-import: table deleted" \
+    grep -q "dynamodb delete-table" "$MOCK_DIR/calls.log"
+rm -rf "$MOCK_DIR"
+
+# ===== scenario 9: F2 does NOT fire outside import (phase-aware) =============
+# During create-table retries / pregen / upload the counter is legitimately
+# frozen. A frozen counter must strike ONLY while phase=import.
+fresh_scenario
+printf 'dynein-bench-testrun-task-w10-mixed-1\t10\n' > "$MOCK_DIR/tables.tsv"
+printf 'i-pregen001\n' > "$MOCK_DIR/instances.txt"
+echo "540" > "$MOCK_DIR/cw_rate"
+mkdir -p "$MOCK_DIR/heartbeat"
+python3 -c 'import json,time; print(json.dumps({"ts": int(time.time()), "cell": "task-w10-mixed", "cell_started": int(time.time())-60, "phase": "create-table", "progress": 4200}))' \
+    > "$MOCK_DIR/heartbeat/m9g.xlarge-s0.json"
+run_watchdog --budget-usd 1000 --progress-frozen-strikes 3 --max-ticks 6; rc=$?
+check "f2-phase-gate: does NOT abort when phase != import" [ "$rc" = "0" ]
+check "f2-phase-gate: never deleted a table" \
+    bash -c '! grep -q "dynamodb delete-table" "$MOCK_DIR/calls.log"'
+rm -rf "$MOCK_DIR"
+
+# ===== scenario 10: F2 tolerates advancing progress (liveness) ==============
+# A genuinely progressing import must never strike, however long it runs.
+fresh_scenario
+printf 'dynein-bench-testrun-task-w10-mixed-1\t10\n' > "$MOCK_DIR/tables.tsv"
+printf 'i-alive0001\n' > "$MOCK_DIR/instances.txt"
+echo "540" > "$MOCK_DIR/cw_rate"
+echo 1 > "$MOCK_DIR/progress_advancing"   # mock bumps progress every read
+mkdir -p "$MOCK_DIR/heartbeat"
+python3 -c 'import json,time; print(json.dumps({"ts": int(time.time()), "cell": "task-w10-mixed", "cell_started": int(time.time())-60, "phase": "import", "progress": 0}))' \
+    > "$MOCK_DIR/heartbeat/m9g.xlarge-s0.json"
+run_watchdog --budget-usd 1000 --progress-frozen-strikes 3 --max-ticks 8; rc=$?
+check "f2-advancing: does NOT abort while progress climbs" [ "$rc" = "0" ]
 rm -rf "$MOCK_DIR"
 
 echo

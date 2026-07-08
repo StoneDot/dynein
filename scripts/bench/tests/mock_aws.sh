@@ -101,7 +101,16 @@ case "$1 $2" in
     src="$3" dst="$4"
     case "$src" in
     *"/heartbeat/"*)
-        cat "$MOCK_DIR/heartbeat/$(basename "$src")" 2>/dev/null ;;
+        body=$(cat "$MOCK_DIR/heartbeat/$(basename "$src")" 2>/dev/null)
+        # progress_advancing: bump the heartbeat's `progress` field on every
+        # read so the runner looks like it is genuinely making progress (F2
+        # liveness test). Without the flag the body is served verbatim.
+        if [ -f "$MOCK_DIR/progress_advancing" ] && [ -n "$body" ]; then
+            n=$(( $(cat "$MOCK_DIR/.progress" 2>/dev/null || echo 0) + 100 ))
+            echo "$n" > "$MOCK_DIR/.progress"
+            body=$(python3 -c 'import json,sys; b=json.loads(sys.stdin.read()); b["progress"]=int(sys.argv[1]); print(json.dumps(b))' "$n" <<<"$body")
+        fi
+        printf '%s\n' "$body" ;;
     *"config.json")
         cp "$MOCK_DIR/config.json" "$dst" 2>/dev/null || exit 1 ;;
     *)
