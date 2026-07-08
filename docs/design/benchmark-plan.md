@@ -591,3 +591,24 @@ Safety nets:
   so burst reset is irrelevant. **Verify the actual billing behavior from
   this run's CUR (UsageType `USW2-WriteCapacityUnit-Hrs`, UsageAmount per
   hour) and record the answer here**
+  - **Answer (2026-07-07, Cost Explorer evidence; CUR line-item confirmation
+    pending — no CUR/Data Export existed in the account)**: provisioned
+    capacity bills as integer unit-hours for **complete clock hours of table
+    existence; partial hours are dropped, not rounded up**. Evidence: 52h
+    after the 2026-07-05 runs, `USW2-WriteCapacityUnit-Hrs` shows **zero
+    records** for every bench table — including the 39k table (09:40–10:18
+    UTC, alive across the 10:00 boundary but never for a whole clock hour) —
+    while long-lived APN1 residual tables bill exact integers (2 RCU → 48,
+    3 WCU → 72 per day) and USW2 EC2/EBS from the same runs recorded fine.
+    The boundary-sampling model is refuted (the 39k table existed at 10:00
+    and was not billed). All three pre-registered hypotheses (prorated
+    ~25.1k / per-table-hour ~41.1k / per-clock-hour ~80.1k) were wrong in
+    the cheap direction: actual = ~0.
+  - **Consequences**: run 090552's DDB cost was ≈ $0 (real spend was the
+    EC2 time); the billing-safe *table-reuse* strategy above is backwards
+    under this model — a reused long-lived table accrues complete hours
+    while fresh sub-60-minute tables are free. Consider reverting to
+    fresh-table-per-cell (lifetime < 1 clock hour) after CUR confirmation.
+    NOTE: that is an on-instance code change → requires a fresh G2 canary.
+    Keep preflight showing the worst-case interpretation until the CUR
+    line items confirm; the behavior is undocumented and could change.
