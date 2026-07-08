@@ -244,6 +244,40 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
   exit 0; `--max-wcu 100` → a steady ~100 items/s for ~1KB items
   (client-side bucket pacing), 15s wall clock for 1,500 items, exit 0
 
+### 4.13 Control plane separated from the work plane in the pool executor (2026-07-08)
+
+- **Decision**: in `ThrottledExecutor` (candidates A/A′), rate updates travel a
+  dedicated per-worker control queue (`CtrlSignal { ChangeRefill | ChangeMaxCap }`,
+  depth 4) instead of the work queue. `Signal` now carries only `Close | Process`.
+  The worker `select!`s over both with `biased` (control first, so a backlog of
+  work cannot delay a rate change). `Close` **stays on the work queue** so it
+  remains ordered behind items already handed to the worker.
+- **Bug it fixes**: control signals occupy a queue slot but complete no work, so
+  a worker dequeuing one fires no `notify_one()` (only `Process` completion
+  notifies). Sharing the work queue, a single buffered control signal could sit
+  in the sole slot at `queue_depth == 1` while the dispatcher was parked on
+  `notifier.notified()` waiting for a completion that would never arrive —
+  deadlock. Candidate A′ (`pool1`) wedged 3/3 on the Stage 1 mixed cells because
+  of this; full analysis in [pool1-deadlock-analysis.md](pool1-deadlock-analysis.md).
+  The defect was latent at every depth; depth 1 merely removed the buffer slack
+  that hid it.
+- **Why this shape, not moving the wakeup to dequeue**: keeping `notify_one()` on
+  `Process` completion means §4.2's unbounded-retry deadlock-freedom argument
+  ("a blocked worker never completes → the executor's `Notify` never fires")
+  stays literally true. Separating the queues restores the invariant that *every
+  message on a work queue runs to completion* without disturbing the notifier's
+  meaning. Candidate B (mpmc) already used a separate `ctrl` channel; this brings
+  the pool executor to the same structure.
+- **`Close` ordering is load-bearing**: routing `Close` through the priority
+  control queue would let it overtake queued work, stranding unprocessed items
+  and breaking invariants 1–2 (item accounting, termination). A guard test pins
+  this (`test_close_does_not_strand_queued_work`).
+- **Verified**: deterministic unit reproduction (red before, green after);
+  guard tests for the `select!` loop (one mutation-checked); `sim_` scenarios
+  green with A′ completing; a powered local E2E (pre-fix exit 124 → post-fix
+  exit 0 on the same mixed 400-item / 10-WCU repro, with the AIMD target change
+  observed in both logs).
+
 ## 5. Groundwork for Future Design (not implemented, but direction-setting)
 
 ### 5.1 Multi-table / GSI support: vectorizing the resource
@@ -286,7 +320,10 @@ measurement, not intuition. The detailed experiment design lives in
   round-robin distributor skips full workers (so it is not blind), but it
   cannot rebalance work already queued — expensive items hold up to 16×25
   items hostage on one worker, visible as a completion tail. Depth 1 may
-  recover most of this within the pool model
+  recover most of this within the pool model. **Note**: depth 1 (candidate A′)
+  exposed a shared-queue deadlock between the dispatcher and workers, fixed in
+  §4.13 by separating the control plane; the benchmark comparison of A′ is only
+  meaningful on the fixed binary
 - **CPU affinity**: the pool model's presumed cache-affinity advantage is
   likely illusory — workers are ordinary tokio tasks and migrate across
   runtime threads (work stealing) unless pinned. Decide with measured CPU
