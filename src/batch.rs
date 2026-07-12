@@ -364,7 +364,7 @@ pub async fn batch_write_item(
     Ok(())
 }
 
-pub fn convert_jsonval_to_hashmap(
+pub(crate) fn convert_jsonval_to_hashmap(
     json_value: &JsonValue,
     enable_set_inference: bool,
 ) -> HashMap<String, AttributeValue> {
@@ -384,7 +384,7 @@ pub fn convert_jsonval_to_hashmap(
     item
 }
 
-pub fn construct_put_write_request(item: HashMap<String, AttributeValue>) -> WriteRequest {
+pub(crate) fn construct_put_write_request(item: HashMap<String, AttributeValue>) -> WriteRequest {
     WriteRequest::builder()
         .put_request(PutRequest::builder().set_item(Some(item)).build().unwrap())
         .build()
@@ -394,7 +394,7 @@ pub fn construct_put_write_request(item: HashMap<String, AttributeValue>) -> Wri
 /// DynamoDB data types of attributes are left to how serde_json parses each
 /// cell. A cell count mismatch against the header is reported as an error so
 /// that a streaming caller can drain already-admitted items before failing.
-pub fn csv_row_to_request_item(
+pub(crate) fn csv_row_to_request_item(
     headers: &[&str],
     line: &str,
     enable_set_inference: bool,

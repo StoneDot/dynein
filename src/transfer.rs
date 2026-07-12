@@ -1202,6 +1202,11 @@ async fn stream_writes_with_chucked(
     )));
     let complete_items_count = Arc::new(AtomicUsize::new(0));
     let failed_items_count = Arc::new(AtomicUsize::new(0));
+    // Set once any BatchWriteItem call returns a valid response — including a
+    // fully-throttled one (every item unprocessed). It feeds the §4.3
+    // transport-error classification: a valid response proves connectivity
+    // even when nothing was written yet.
+    let any_success_response = Arc::new(AtomicBool::new(false));
 
     // Admission control (see ADMISSION_ITEM_CAP): one permit per item inside
     // the pipeline. Permits are forgotten on acquisition and re-added when
@@ -1239,6 +1244,10 @@ async fn stream_writes_with_chucked(
         complete_items_count: Arc<AtomicUsize>,
         failed_items_count: Arc<AtomicUsize>,
         admission: Arc<tokio::sync::Semaphore>,
+        /// True once any prior BatchWriteItem call returned a valid response
+        /// (even one with every item unprocessed). See §4.3: connectivity is
+        /// proven by a response, not by a written item.
+        any_success_response: Arc<AtomicBool>,
     }
 
     impl algo::task_executor::ResourceConstraintProcess for BatchWriteProcess {
@@ -1274,9 +1283,16 @@ async fn stream_writes_with_chucked(
                 .send()
                 .await;
 
-            let has_prior_success = self.complete_items_count.load(Ordering::Relaxed) > 0;
+            // "Prior success" = a prior call returned a valid response, not a
+            // written item: a fully-throttled but healthy start must not turn
+            // a later transport blip into a first-attempt permanent failure.
+            let has_prior_success = self.any_success_response.load(Ordering::Relaxed);
+            let response_ok = result.is_ok();
             let summary =
                 summarize_batch_write_result(result, &self.write_items, has_prior_success);
+            if response_ok {
+                self.any_success_response.store(true, Ordering::Relaxed);
+            }
 
             // Queue items for later retry. The retry channel is unbounded so this never
             // blocks; blocking here can deadlock the whole pipeline because the chunking
@@ -1327,7 +1343,11 @@ async fn stream_writes_with_chucked(
     // Task-per-request executor with a shared bucket — adopted as the sole
     // architecture by the Tier-1 benchmark (import-throttling.md §6). The
     // benchmark-era candidates live at tag pre-task-unification-20260711.
-    let mut executor = algo::task_executor::TaskExecutor::new(rx2, max_wcu, hints.initial_wcu);
+    // The shutdown signal lets the stall abort preempt a long token wait;
+    // without it an abort decision could leave the executor sleeping on the
+    // bucket for hours (low target × large batch) before the process exits.
+    let mut executor = algo::task_executor::TaskExecutor::new(rx2, max_wcu, hints.initial_wcu)
+        .with_shutdown(terminate_rx.clone());
 
     // Start the slow control loop when a capacity reference is known. It
     // consults CloudWatch to recover more aggressively when it looks safe.
@@ -1372,6 +1392,7 @@ async fn stream_writes_with_chucked(
     let status = progress_status.clone();
     let count = complete_items_count.clone();
     let failed = failed_items_count.clone();
+    let any_success_for_chunker = any_success_response.clone();
     let admission_for_chunker = admission.clone();
     let chunking_handle = tokio::spawn(async move {
         let mut items = Vec::with_capacity(25);
@@ -1439,6 +1460,7 @@ async fn stream_writes_with_chucked(
                 complete_items_count: count.clone(),
                 failed_items_count: failed.clone(),
                 admission: admission_for_chunker.clone(),
+                any_success_response: any_success_for_chunker.clone(),
             })
             .await
             .expect("Failed to pass items to write");
@@ -1527,7 +1549,17 @@ async fn stream_writes_with_chucked(
                 failed_items_count
             );
             let resolved_items = complete_items_count + failed_items_count;
-            if producer_done && total_items_count == resolved_items {
+            // `>` cannot happen while the exactly-once accounting invariant
+            // (design doc §3.1) holds; terminating on `>=` keeps a
+            // hypothetical over-accounting bug loud and prompt instead of
+            // converting it into a stall only the deadline below would catch.
+            if producer_done && resolved_items >= total_items_count {
+                if resolved_items > total_items_count {
+                    error!(
+                        "Item accounting invariant violated: resolved {} > admitted {}",
+                        resolved_items, total_items_count
+                    );
+                }
                 terminate_tx
                     .send(true)
                     .expect("Failed to terminate the chunking process");

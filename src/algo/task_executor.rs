@@ -134,6 +134,12 @@ pub struct TaskExecutor<T: ResourceConstraintProcess + Clone> {
     target_gauge: Arc<TargetGauge>,
     /// Instruments the spawned request tasks for the benchmark stats
     task_monitor: tokio_metrics::TaskMonitor,
+    /// External shutdown signal (e.g. the pipeline's stall abort). When it
+    /// turns true, the run loop abandons not-yet-executed work instead of
+    /// paying the token clock for it; without this, an abort during a long
+    /// token wait (low target × large estimate) could keep the process
+    /// blocked in `sleep_until` for hours after the abort decision.
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> TaskExecutor<T> {
@@ -189,7 +195,17 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> TaskExecutor
             boost_slot: Arc::new(BoostSlot::default()),
             target_gauge: Arc::new(TargetGauge::new(effective)),
             task_monitor: tokio_metrics::TaskMonitor::new(),
+            shutdown: None,
         }
+    }
+
+    /// Attaches an external shutdown signal. When the watched value turns
+    /// true, `run` stops accepting work, abandons anything not yet executed
+    /// (the pipeline is aborting; those items resolve as an import error),
+    /// waits for the already-spawned request tasks and returns `Ok`.
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
     }
 
     /// Shared counters of processed/throttled requests and consumed capacity.
@@ -219,10 +235,21 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> TaskExecutor
     }
 
     /// Runs the executor: paces requests through the shared bucket and spawns
-    /// one task per request. Returns once the input channel is closed and all
-    /// spawned request tasks have finished.
+    /// one task per request. Returns once the input channel is closed — or the
+    /// shutdown signal turns true — and all spawned request tasks have
+    /// finished. Work not yet executed at shutdown is abandoned: an aborting
+    /// pipeline must not pay the token clock for items it is going to report
+    /// as failed anyway.
     pub async fn run(&mut self) -> Result<(), ExecutorError> {
-        while let Some(process) = self.recv.recv().await {
+        'accept: loop {
+            let process = tokio::select! {
+                biased;
+                _ = Self::shutdown_signaled(&mut self.shutdown) => break 'accept,
+                received = self.recv.recv() => match received {
+                    Some(process) => process,
+                    None => break 'accept,
+                },
+            };
             let estimate = process.estimate_resource();
 
             // Acquire tokens from the shared bucket before spawning. This is
@@ -239,7 +266,13 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> TaskExecutor
                 };
                 match wait_until {
                     None => break,
-                    Some(at) => tokio::time::sleep_until(at).await,
+                    Some(at) => {
+                        tokio::select! {
+                            biased;
+                            _ = Self::shutdown_signaled(&mut self.shutdown) => break 'accept,
+                            _ = tokio::time::sleep_until(at) => {}
+                        }
+                    }
                 }
             }
 
@@ -269,15 +302,32 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> TaskExecutor
             self.grow_in_flight_if_needed();
         }
 
-        // The input channel is closed: wait for all in-flight tasks. Their
-        // permits return to the semaphore when the tasks finish (including on
-        // panic, since the owned permit is dropped on unwind).
+        // The input channel is closed (or shutdown fired): wait for all
+        // in-flight tasks. Their permits return to the semaphore when the
+        // tasks finish (including on panic, since the owned permit is dropped
+        // on unwind).
         let _all = self
             .semaphore
             .acquire_many(self.current_cap as u32)
             .await
             .expect("The request semaphore is never closed");
         Ok(())
+    }
+
+    /// Resolves when the attached shutdown signal turns true; pends forever
+    /// when no signal is attached or its sender is gone without signaling.
+    async fn shutdown_signaled(shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+        match shutdown {
+            None => std::future::pending::<()>().await,
+            Some(rx) => loop {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            },
+        }
     }
 
     /// Doubles the in-flight cap when the governor approves: measured
@@ -460,6 +510,33 @@ mod tests {
         assert!(executor.in_flight_cap() <= 2);
         // 30 requests at ≤2 in flight and 50ms each need ≥ 0.75s.
         assert!(offsets.last().unwrap() >= &0.75, "got {:?}", offsets.last());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_interrupts_the_token_wait() {
+        let recorder = SimRecorder::new();
+        let (tx, rx) = channel(16);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // Target 0.001/s: the cost-1000 request would owe the bucket ~10^6
+        // seconds of token clock before executing.
+        let mut executor = TaskExecutor::new(rx, 0.001, None).with_shutdown(shutdown_rx);
+        tx.send(recorder.process(1000.0, Duration::from_millis(10)))
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let run = tokio::spawn(async move { executor.run().await });
+        // Let run() park on the bucket wait, then abort the pipeline.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        shutdown_tx.send(true).unwrap();
+        drop(tx);
+
+        run.await.unwrap().unwrap();
+
+        // The abandoned request must not have executed, and the return must
+        // not have waited out the token clock (virtual time barely advanced).
+        assert_eq!(recorder.records().len(), 0);
+        let elapsed = Instant::now().duration_since(started);
+        assert!(elapsed < Duration::from_secs(10), "took {:?}", elapsed);
     }
 
     #[tokio::test(start_paused = true)]

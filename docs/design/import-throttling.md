@@ -2,7 +2,7 @@
 
 - Status: Draft (design record for the wip branch `improve-export-import`)
 - Last updated: 2026-07-11
-- Target branch: `improve-export-import` (source of truth: remote `my/improve-export-import`)
+- Target branch: `improve-export-import`
 - **Experiment archive**: the benchmark plan, the disposable-fleet harness
   (`scripts/bench/`), the postmortems and the deadlock analysis referenced in
   this document are deliberately excluded from the pull request. They are
@@ -41,7 +41,7 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - **`src/algo/bucket.rs`** — Token bucket. Consumes the estimated amount up front and corrects the difference against the actually consumed amount via `feedback(estimate - actual)`
 - **`src/algo/monitor.rs`** — `Probe` (sends observations) / `Monitor` (statistical throughput judgement using mean + standard deviation)
 - **`src/algo/task_executor.rs`** — `TaskExecutor`: acquires tokens from a **single shared bucket**, then spawns one tokio task per BatchWriteItem request; the in-flight cap starts at 1 and doubles under `src/algo/governor.rs` (`ScaleOutGovernor`) while throughput lags the effective target and growing demonstrably helps. Chosen over fixed worker-pool architectures by the Tier-1 benchmark (§6 2026-07-11). The workload is abstracted behind the `ResourceConstraintProcess` trait (`estimate_resource` / `process_and_consume_resource`) and is **DynamoDB-agnostic**
-- **`src/ddb/item.rs`** — Item size → WCU estimation based on the heuristics in the official documentation
+- **`src/ddb/item.rs`** — Item byte-size calculation per the official documentation's heuristics; `BatchWriteProcess::estimate_resource` (transfer.rs) converts that into a WCU estimate (1KiB rounding, delete estimates)
 - **`src/transfer.rs`** — Pipeline assembly (`stream_writes_with_chucked`). It takes a push-based source of `WriteRequest`s (a closure receiving a sink; §4.11), so json/jsonl/csv all go through this path while streaming from the file
 
 ## 3. Invariants (breaking these is a bug)
@@ -71,7 +71,7 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 
 ### 4.3 Transport errors: "retry after the first success, fail on the first attempt"
 
-- **Decision**: for `TimeoutError` / `DispatchFailure` / `ResponseError`, if at least one request has succeeded before, the network configuration is assumed correct and all items are retried. Failures starting from the very first request most likely indicate a configuration problem, so the items are marked permanently failed and the import terminates
+- **Decision**: for `TimeoutError` / `DispatchFailure` / `ResponseError`, if at least one prior BatchWriteItem call returned a **valid response** — including a response in which every item came back unprocessed (a fully throttled but healthy start) — connectivity is proven, so all items are retried. Failures starting from the very first request most likely indicate a configuration problem, so the items are marked permanently failed and the import terminates. ("Success" is deliberately a response, not a written item: counting written items would misclassify a transport blip after a fully-throttled start as a first-attempt failure — found in review 2026-07-12)
 - **Known hole, now closed**: if the network dies permanently after the first success, the transport-error retries would loop forever (zero progress, no termination). The progress deadline (§4.8) aborts the import in this situation
 
 ### 4.4 Classification of service errors
@@ -88,8 +88,8 @@ even-split uniformity assumption and its multi-table concern (§5.3) are gone
 by construction. The feedback mechanism itself carries over unchanged.
 
 - Estimates are consumed up front; the difference against the measured consumption (sum of `consumed_capacity`) is refunded or charged. Introduced as the countermeasure to "wobbly WCU consumption"
-- The executor splits the target rate evenly as `target_limit / num_workers`, and each worker looks only at its own bucket (lock-free). This rests on **the assumption that traffic is uniform across workers**. Multi-table support may make this assumption too strong (§5.3)
-- Scale-out doubles the worker count when measured throughput is statistically (3σ) below the target. `1f2d0a2` added over-scale-out suppression. In addition, scale-out decisions now use the AIMD *effective* target and are frozen entirely while the congestion controller is backing off, which fixes "scaling out in the wrong direction when throttling is the reason the target is missed" (§4.6)
+- The pool executor split the target rate evenly as `target_limit / num_workers`, each worker watching only its own bucket (lock-free). That rested on **the assumption that traffic is uniform across workers** — one of the reasons the shared-bucket task executor replaced it (§5.3, resolved)
+- Scale-out (now: in-flight cap growth, §4.10) doubles the parallelism when measured throughput is statistically (3σ) below the target. `1f2d0a2` added over-scale-out suppression. In addition, growth decisions use the AIMD *effective* target and are frozen entirely while the congestion controller is backing off, which fixes "scaling out in the wrong direction when throttling is the reason the target is missed" (§4.6)
 
 ### 4.6 AIMD congestion control, fast loop (`src/algo/congestion.rs`)
 
@@ -98,8 +98,8 @@ by construction. The feedback mechanism itself carries over unchanged.
 - **Timing design (decrease fast, recover slow)**: the calm period between recovery steps is **60 s, deliberately aligned with the CloudWatch metric granularity** so the future slow loop can consult metrics between steps. The recovery step is **10% of the *current* effective target** (gentle x1.1 compounding; a halved target returns in ~7 minutes) — deliberately *not* a ratio of the user ceiling, because the ceiling can be far above realistic capacity and a ceiling-relative step would make the first recovery jump enormous when running low
 - **Initial effective target from known information**: instead of starting blind at the ceiling, `capacity_hints()` (transfer.rs) derives a realistic starting point: provisioned tables start at **80% of the provisioned WCU** (leaving headroom for production from the beginning), on-demand tables at the **table's actual warm throughput** (`TableDescription::warm_throughput.write_units_per_second` — readable since the 2026-07-05 rebase onto upstream main brought aws-sdk-dynamodb 1.93; the platform default 4,000 remains the fallback when DescribeTable does not report it, and no 80%-style ratio is applied because warm throughput is already "instantly absorbable" capacity, not an entitlement to protect). **Empirical note (2026-07-05, ap-northeast-1)**: despite the documentation saying every table has warm throughput values, DescribeTable returned `WarmThroughput: null` both for a freshly created on-demand table and for a long-lived provisioned one — the field appears to be populated only when warm throughput was explicitly set. In practice the fallback covers default tables and the readout matters for tables with purchased warm throughput. The same gradual recovery then probes upward from the initial value toward the ceiling
 - **`is_congested` semantics**: "a throttle event was observed within the last calm period" — used to freeze scale-out. Starting below the ceiling due to an initial target is *not* congestion (otherwise scale-out would be frozen from the start)
-- **Congestion signal definition** (decided in `summarize_batch_write_result`): a request is "throttled" when the whole request was rejected with `ProvisionedThroughputExceededException` / `RequestLimitExceeded`, or when **at least one** of its items came back unprocessed. Every unprocessed item is a server-side rejection due to a capacity shortage, so for production-workload protection even a single one counts (a majority-based threshold was considered and rejected as too lenient). The decrease cooldown keeps this strictness from over-reacting, at the cost of the steady state possibly sitting somewhat below the entitlement — accepted as the intended production-first policy; revisit with benchmark data if it proves too conservative. `InternalServerError` is retryable but is *not* a congestion signal
-- **Wiring**: `ResourceConstraintProcess::process_and_consume_resource` returns `ProcessResult { consumed, throttled }` (the minimal observation-type extension; the keyed generalization of §5.1 remains). Request tasks record outcomes into `CongestionStats` (two shared atomics — no extra channels); the executor reads deltas on each run-loop iteration, feeds the controller, and applies new targets to the shared bucket directly (until the 2026-07-11 unification this traveled per-worker `Signal::ChangeRefill` / `ChangeMaxCap` channels; see §4.13)
+- **Congestion signal definition** (decided in `summarize_batch_write_result`): a request is "throttled" when the whole request was rejected with `ProvisionedThroughputExceededException` / `RequestLimitExceeded`, or when **at least one** of its items came back unprocessed. Per the API contract an unprocessed item means a capacity shortage *or* an internal processing failure; both warrant backing off and the former dominates in practice, so for production-workload protection even a single one counts (a majority-based threshold was considered and rejected as too lenient). The decrease cooldown keeps this strictness from over-reacting, at the cost of the steady state possibly sitting somewhat below the entitlement — accepted as the intended production-first policy; revisit with benchmark data if it proves too conservative. `InternalServerError` is retryable but is *not* a congestion signal
+- **Wiring**: `ResourceConstraintProcess::process_and_consume_resource` returns `ProcessResult { consumed, throttled }` (the minimal observation-type extension; the keyed generalization of §5.1 remains). Request tasks record outcomes into `CongestionStats` (three shared atomics: requests, throttles, consumed capacity — no extra channels); the executor reads deltas on each run-loop iteration, feeds the controller, and applies new targets to the shared bucket directly (until the 2026-07-11 unification this traveled per-worker `Signal::ChangeRefill` / `ChangeMaxCap` channels; see §4.13)
 - **Interaction with scale-out**: decisions compare against the effective target, and scale-out is frozen while congested
 - **Caveat**: the controller only ticks when messages flow through the executor. Under total silence it does not tick, but in that situation there is nothing to pace either; the progress deadline (§4.8) covers pathological cases
 
@@ -141,10 +141,11 @@ by construction. The feedback mechanism itself carries over unchanged.
 - **Decision**: the essential control problem — the number of parallel
   in-flight requests against the required throughput — is the same in every
   executor architecture, so the pool's scale-out decision was extracted
-  into `src/algo/governor.rs` and is now used by all candidates: the pools
-  grow their worker count and the task-per-request candidate grows its
-  in-flight cap (start 1, doubling, ceiling `task<N>`, default 256) under
-  identical logic (grow only when measured throughput is statistically
+  into `src/algo/governor.rs` and was used by every benchmark candidate
+  under identical logic: the pools grew their worker count, and the
+  task-per-request executor — its only consumer since the 2026-07-11
+  unification — grows its in-flight cap (start 1, doubling, default
+  ceiling 256) (grow only when measured throughput is statistically
   below the effective target; stop when the previous growth did not
   demonstrably help; freeze while congested; ramp wait between steps)
 - **Bug fixes surfaced by the extraction** (both unit-tested):
@@ -297,13 +298,37 @@ is a load-bearing invariant for any future queue-based executor.
   exit 0 on the same mixed 400-item / 10-WCU repro, with the AIMD target change
   observed in both logs).
 
+### 4.14 Abort responsiveness and defensive accounting (2026-07-12, from second-opinion review)
+
+- **The stall abort preempts the executor's token wait**: `TaskExecutor`
+  accepts an external shutdown signal (`with_shutdown`, wired to the
+  pipeline's terminate channel). Without it, an abort decision during a
+  long token wait (low effective target × large batch estimate) left the
+  process sleeping on the bucket — for hours in the worst case — because
+  the pipeline awaits the executor before reporting the abort. On
+  shutdown the executor abandons not-yet-executed work (the import is
+  reporting an error anyway), waits only for already-spawned request
+  tasks, and returns. Pinned by a virtual-time unit test
+- **Completion check is `>=` with a loud error on `>`**: `resolved >
+  admitted` is impossible while the exactly-once accounting invariant
+  (§3.1) holds; guarding it keeps a hypothetical over-accounting bug
+  prompt and visible instead of degrading into a silent stall
+- **Known limitation (accepted)**: a panic inside a spawned request task
+  returns its concurrency permit (owned permit drops on unwind) but
+  records no accounting, so its items resolve nowhere and the run ends
+  via the progress deadline (§4.8) rather than immediately. Such a panic
+  is itself a bug; the deadline — now prompt thanks to the shutdown
+  signal above — is the designed backstop
+- Shutdown latency of the CloudWatch slow loop is bounded by one
+  in-flight `GetMetricStatistics` call at termination time (accepted)
+
 ## 5. Groundwork for Future Design (not implemented, but direction-setting)
 
 ### 5.1 Multi-table / GSI support: vectorizing the resource
 
-- **Current constraint**: resource = scalar f64 is baked into every layer (return values of `ResourceConstraintProcess`, `Bucket`, `Signal`, `Monitor`, the executor target). BatchWriteItem can write to multiple tables in one request, but consumption and throttling are independent per table (+ per GSI)
-- **Direction**: generalize f64 into a lightweight vector type keyed by resource (`Table(name)` / `Gsi(table, index)` → amount). **GSI support just adds more keys**, so the same abstraction covers it automatically (one abstraction removes both TODOs in `bucket.rs` and `worker.rs`)
-- **Timing**: do it in Phase 4 (foundation generalization). Now — while `BatchWriteProcess` is the only trait implementor — is the cheapest moment for the breaking change. However, Phase 3 (benchmark) may still reshape executor internals, so do it after that settles
+- **Current constraint**: resource = scalar f64 is baked into every layer (return values of `ResourceConstraintProcess`, `Bucket`, `Monitor`, the executor target and the shared-bucket refill). BatchWriteItem can write to multiple tables in one request, but consumption and throttling are independent per table (+ per GSI)
+- **Direction**: generalize f64 into a lightweight vector type keyed by resource (`Table(name)` / `Gsi(table, index)` → amount). **GSI support just adds more keys**, so the same abstraction covers it automatically (one abstraction removes the TODOs in `bucket.rs` and `task_executor.rs`)
+- **Timing**: do it in Phase 4 (foundation generalization). Now — while `BatchWriteProcess` is the only trait implementor — is the cheapest moment for the breaking change. The benchmark has settled the executor shape (§6 2026-07-11), so this is now unblocked
 - **Groundwork in the transfer layer**: `WriteRequest` flowing through the pipeline carries no table name (the chunker injects the single table name). For multi-table, make the channel element `(table name, WriteRequest)` and let the chunker group by table. This can be changed independently of algo
 - **Consumption semantics**: a request spanning multiple keys consumes atomically only when capacity is sufficient for all keys (all-or-nothing). `estimate_available_at` becomes the max across keys
 
@@ -379,9 +404,8 @@ rules; archived at the experiment archive tag). Summary:
   removes that axis
 - Metrics: throughput, WCU adherence (mean ± σ), token waste, completion
   tail, wasted requests, CPU time / max RSS
-- Environment: disposable EC2 (m9g.xlarge / m8a.xlarge) bootstrapped via
-  user data, results persisted to S3, instances self-terminate — designed
-  for running many cells cheaply
+- Environment: disposable cloud instances (Graviton and AMD x86) running
+  many isolated cells cheaply; harness archived at the experiment tag
 - **Run after AIMD** (done): retry storms and wrong-direction scale-out
   would have distorted results as noise
 - Close the losing branch when Q5 is settled
@@ -392,10 +416,9 @@ rules; archived at the experiment archive tag). Summary:
 
 Tier-1 sweep finished on real DynamoDB at account-quota scale (m9g.xlarge,
 us-west-2; Stage 1 = w10 full matrix run `20260707-152019`, Stage 2 =
-quota-only 39k-WCU matrix run `20260711-140009`, 24/24 reps exit 0, ~$1
-real spend). Full numbers: the benchmark plan's §7 scoring and the raw
-results, both preserved at the experiment archive tag (+ S3
-`runs/20260711-140009/`, run-notes.md included).
+quota-only 39k-WCU matrix run `20260711-140009`, 24/24 reps exit 0).
+Full numbers: the benchmark plan's §7 scoring and the raw results
+(run-notes included), preserved at the experiment archive tag.
 
 - **Decision: consolidate on candidate C (task-per-request + shared bucket
   + governor-capped in-flight)**. No candidate hit a disqualifying
@@ -487,14 +510,14 @@ results, both preserved at the experiment archive tag (+ S3
 - Observed the "wrong-direction" scale-out 1→2→4→8 in the middle of a throttling storm (the evidence behind §4.6)
 - The current chunker sends whatever `recv_many` returns, producing many partial chunks of fewer than 25 items (a throughput inefficiency; to be quantified in the benchmark)
 - AIMD verification (10-WCU table, 2000 items, sustained throttling): the effective target halved stepwise from the hardcoded 100,000 down to ~98 while throttling persisted, and the import completed with exit 0. This run motivated the known-information initial target: starting from the absurd 100,000 ceiling took ~13 halvings (~30 s) to reach realistic levels. The `--max-wcu` CLI option (roadmap 6) still matters for setting a sane ceiling
-- Two-loop end-to-end verification (10-WCU table, 2000-item import + a pseudo production writer at 7 WCU/s via `scripts/pseudo_prod_writer.py`): while production ran, the import backed off 8→4→2→1 and slow-loop suggestions stayed below the effective target, so no boost fired — production stayed protected. After the production writer stopped, CloudWatch reflected it within ~3 minutes and the slow loop boosted 1.66→2.42→5.00 (exactly half of the freed 10 WCU), after which the fast loop kept probing upward (5.50, 6.05, ...). The `max(0, ..)` guard absorbed window-misalignment moments where our own measured rate exceeded the table-level rate. DynamoDB Local cannot be used for these experiments: it neither throttles nor emits CloudWatch metrics
+- Two-loop end-to-end verification (10-WCU table, 2000-item import + a pseudo production writer at 7 WCU/s (script archived at the experiment tag)): while production ran, the import backed off 8→4→2→1 and slow-loop suggestions stayed below the effective target, so no boost fired — production stayed protected. After the production writer stopped, CloudWatch reflected it within ~3 minutes and the slow loop boosted 1.66→2.42→5.00 (exactly half of the freed 10 WCU), after which the fast loop kept probing upward (5.50, 6.05, ...). The `max(0, ..)` guard absorbed window-misalignment moments where our own measured rate exceeded the table-level rate. DynamoDB Local cannot be used for these experiments: it neither throttles nor emits CloudWatch metrics
 
 ## 7. Roadmap
 
 1. ~~Build the experiment environment, reproduce the stall, fix item accounting~~ (done)
 2. ~~Minimal AIMD (fast loop only) + progress deadline + effective-target-based scale-out decisions~~ (done; §4.6, §4.8)
 3. ~~CloudWatch slow control loop (informed recovery)~~ (done; §4.7)
-4. ~~Settle the executor/chunker architecture via benchmark~~ (done 2026-07-11; §6, verdict = task (C), unification in progress) ← **current: consolidate the implementation on C, delete pool/mpmc paths**
+4. ~~Settle the executor/chunker architecture via benchmark and consolidate on the winner~~ (done 2026-07-11; §6 — task (C) adopted, pool/mpmc paths deleted, preserved at the experiment archive tag)
 5. Foundation generalization: resource vectorization (§5.1), move generic parts of `BatchWriteProcess` into algo, reduce `expect`s, scale-in
 6. ~~Finish import: streaming file reads + semaphore admission control (§5.2 → §4.11), `--max-wcu` CLI option (§4.12)~~ (done)
 7. Parallel scan for export (RCU variant, separate branch)
