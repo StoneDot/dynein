@@ -14,17 +14,23 @@
  * limitations under the License.
  */
 
-//! Candidate C of the benchmark plan: task-per-request execution.
+//! The throttled executor: task-per-request execution.
 //!
-//! Instead of a fixed worker pool with per-worker queues and split buckets,
-//! the run loop acquires tokens from a **single shared bucket**, then spawns
-//! one tokio task per request (one BatchWriteItem call — never one item; see
-//! benchmark-plan.md §2). AIMD congestion control updates the shared
-//! bucket's refill rate directly; there are no Signal channels and no
-//! round-robin distribution.
+//! The run loop acquires tokens from a **single shared bucket**, then spawns
+//! one tokio task per request (one BatchWriteItem call — never one item).
+//! AIMD congestion control updates the shared bucket's refill rate directly;
+//! there are no per-worker queues, Signal channels or round-robin
+//! distribution.
 //!
-//! In-flight concurrency is governed the same way the pools govern their
-//! worker count: the cap starts at 1 and doubles under the shared
+//! This was candidate C of the executor benchmark and was adopted as the
+//! sole architecture after the Tier-1 EC2 sweep (import-throttling.md §6,
+//! 2026-07-11; benchmark-plan.md §7): best-or-tied throughput in every
+//! regime with the lowest token waste, CPU and RSS, and direct evidence
+//! that it sustains the AIMD target wherever the pools did. The rejected
+//! candidates (fixed worker pools, shared-MPMC pool) and the runtime
+//! selection machinery are preserved at tag `pre-task-unification-20260711`.
+//!
+//! In-flight concurrency starts at 1 and doubles under the shared
 //! [`ScaleOutGovernor`] while the measured throughput is below the effective
 //! target *and* growing keeps helping. Rate × latency then determines how
 //! much of the cap is actually used; the governor keeps the cap from
@@ -32,16 +38,61 @@
 
 use crate::algo::bucket::Bucket;
 use crate::algo::congestion::{AimdController, BoostSlot, CongestionStats, TargetGauge};
-use crate::algo::executor::ExecutorError;
 use crate::algo::governor::ScaleOutGovernor;
 use crate::algo::monitor::Probe;
-use crate::algo::worker::{ResourceConstraintProcess, MINIMUM_WORKER_TARGET_LIMIT};
 use log::info;
 use std::fmt::Debug;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
+
+/// Error surfaced by the executor. Failures inside spawned request tasks are
+/// carried as a message.
+#[derive(Debug, thiserror::Error)]
+#[error("executor error: {0}")]
+pub struct ExecutorError(pub String);
+
+/// The outcome of a single resource-consuming process execution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProcessResult {
+    /// The amount of resource actually consumed.
+    pub consumed: f64,
+    /// Whether the process observed a capacity shortage. Used as the
+    /// congestion signal for AIMD control of the effective target.
+    pub throttled: bool,
+}
+
+/// Trait representing a process with resource constraints.
+///
+/// This trait provides methods for estimating the resource required by the process and
+/// processing while consuming the resource.
+/// TODO: extend the implementation to support GSIs and tables
+pub trait ResourceConstraintProcess {
+    /// Estimates the resource based on the given code.
+    ///
+    /// This method returns an estimation of the amount of resources.
+    /// The actual implementation of how the estimation is calculated
+    /// should be provided by the implementor of this trait.
+    ///
+    /// # Returns
+    ///
+    /// Returns an instance of `f64` that represents
+    /// the estimated amount of resources.
+    fn estimate_resource(&self) -> f64;
+
+    /// Processes and consumes the resource asynchronously.
+    ///
+    /// This function asynchronously processes and consumes a resource, returning a `Future`
+    /// that will eventually resolve to a [`ProcessResult`] carrying the amount of consumed
+    /// resource and whether the process observed a capacity shortage (throttling).
+    fn process_and_consume_resource(&self) -> impl Future<Output = ProcessResult> + Send;
+}
+
+// Even if round trip time is 1s, we can achieve the specified WCU with this
+// floor unless latency is far higher.
+pub(crate) const MINIMUM_TARGET_LIMIT: f64 = 1.0;
 
 /// Default ceiling for the adaptive in-flight cap. The concurrency this
 /// architecture actually needs emerges from rate × latency: even a
@@ -106,7 +157,7 @@ impl<T: ResourceConstraintProcess + Send + Clone + Debug + 'static> TaskExecutor
         initial_target: Option<f64>,
         max_concurrency: usize,
     ) -> TaskExecutor<T> {
-        let min_target = MINIMUM_WORKER_TARGET_LIMIT.min(target_limit);
+        let min_target = MINIMUM_TARGET_LIMIT.min(target_limit);
         let congestion = AimdController::with_initial_target(
             target_limit,
             initial_target.unwrap_or(target_limit),

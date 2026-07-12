@@ -26,7 +26,7 @@
 //! estimate (phase 1: infinite capacity, never throttled). This deliberately
 //! isolates the client-side scheduling questions; see the design document.
 
-use crate::algo::worker::{ProcessResult, ResourceConstraintProcess};
+use crate::algo::task_executor::{ProcessResult, ResourceConstraintProcess};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -144,33 +144,24 @@ pub fn compute_scenario_result(
 
 #[cfg(test)]
 mod scenarios {
-    //! The four regime scenarios of benchmark-plan.md §2.5, run manually with
+    //! The regime scenarios of benchmark-plan.md §2.5, run manually with
     //! `cargo test --bin dy sim_ -- --ignored --nocapture`.
     //!
-    //! The comparative numbers are printed, not asserted: they are recorded
-    //! as *predictions* for the EC2 runs (a falsified hypothesis must not
-    //! break the build). Only completeness is asserted.
+    //! Originally a four-candidate comparison harness; since the Tier-1
+    //! benchmark settled the architecture on the task executor
+    //! (import-throttling.md §6, tag `pre-task-unification-20260711` for
+    //! the multi-candidate version), these run the adopted executor only.
+    //! The numbers are printed, not asserted, to keep a scheduling-regression
+    //! lens on the same workload shapes. Only completeness is asserted.
 
     use super::*;
-    use crate::algo::executor::{AnyExecutor, ExecutorKind};
+    use crate::algo::task_executor::TaskExecutor;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use tokio::sync::mpsc::channel;
 
     /// One request: (capacity cost, service latency).
     type Spec = (f64, Duration);
-
-    const CANDIDATES: [(&str, ExecutorKind); 4] = [
-        ("A  pool16", ExecutorKind::Pool { queue_depth: 16 }),
-        ("A' pool1", ExecutorKind::Pool { queue_depth: 1 }),
-        ("B  mpmc", ExecutorKind::Mpmc),
-        (
-            "C  task",
-            ExecutorKind::Task {
-                max_in_flight: None,
-            },
-        ),
-    ];
 
     /// Latency model: a 5–20ms base (connection/server time) plus a
     /// size-proportional transfer component. Deterministic per seed.
@@ -204,14 +195,14 @@ mod scenarios {
             .collect()
     }
 
-    /// Runs one candidate over the given request sequence and returns the
+    /// Runs the executor over the given request sequence and returns the
     /// comparable metrics. The channel capacity matches the process channel
     /// of the transfer pipeline.
-    async fn run_candidate(kind: ExecutorKind, target: f64, specs: &[Spec]) -> ScenarioResult {
+    async fn run_executor(target: f64, specs: &[Spec]) -> ScenarioResult {
         let recorder = SimRecorder::new();
         let start = Instant::now();
         let (tx, rx) = channel(16);
-        let mut executor = AnyExecutor::new(kind, rx, target, Some(target));
+        let mut executor = TaskExecutor::new(rx, target, Some(target));
         let feeder = {
             let recorder = recorder.clone();
             let specs = specs.to_vec();
@@ -223,7 +214,7 @@ mod scenarios {
                 }
             })
         };
-        executor.run().await.expect("The candidate executor failed");
+        executor.run().await.expect("The executor failed");
         feeder.await.expect("The feeder task failed");
         compute_scenario_result(&recorder.records(), start, target)
     }
@@ -239,26 +230,18 @@ mod scenarios {
             total_cost / target,
         );
         println!(
-            "{:<10} {:>10} {:>12} {:>10} {:>10}",
-            "candidate", "makespan", "utilization", "tail", "completed"
+            "{:<10} {:>12} {:>10} {:>10}",
+            "makespan", "utilization", "tail", "completed"
         );
-        for (label, kind) in CANDIDATES {
-            let result = run_candidate(kind, target, specs).await;
-            println!(
-                "{:<10} {:>9.2}s {:>11.1}% {:>9.2}s {:>10}",
-                label,
-                result.makespan_secs,
-                result.utilization * 100.0,
-                result.tail_secs,
-                result.completed,
-            );
-            assert_eq!(
-                result.completed,
-                specs.len(),
-                "candidate {:?} lost requests",
-                kind
-            );
-        }
+        let result = run_executor(target, specs).await;
+        println!(
+            "{:>9.2}s {:>11.1}% {:>9.2}s {:>10}",
+            result.makespan_secs,
+            result.utilization * 100.0,
+            result.tail_secs,
+            result.completed,
+        );
+        assert_eq!(result.completed, specs.len(), "the executor lost requests");
     }
 
     /// Regime "many small uniform items at a high request rate" — the

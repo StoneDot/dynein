@@ -246,6 +246,13 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 
 ### 4.13 Control plane separated from the work plane in the pool executor (2026-07-08)
 
+**Note (2026-07-11)**: the pool executor this section fixed was removed when
+the implementation was consolidated on the task executor (§6 2026-07-11); the
+fixed code and its regression tests are preserved at tag
+`pre-task-unification-20260711`. The section stays as the record of the
+deadlock analysis and of why "everything on a work queue runs to completion"
+is a load-bearing invariant for any future queue-based executor.
+
 - **Decision**: in `ThrottledExecutor` (candidates A/A′), rate updates travel a
   dedicated per-worker control queue (`CtrlSignal { ChangeRefill | ChangeMaxCap }`,
   depth 4) instead of the work queue. `Signal` now carries only `Close | Process`.
@@ -296,9 +303,19 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 
 ### 5.3 Open performance questions: executor topology, partitioned vs shared buckets
 
-These are **unverified performance hypotheses** that must be settled by
-measurement, not intuition. The detailed experiment design lives in
-`benchmark-plan.md`; this section records what is in question and why.
+**RESOLVED 2026-07-11 — settled by the Tier-1 EC2 benchmark, see §6
+(2026-07-11) and `benchmark-plan.md` §7. Outcome: task-per-request (C)
+adopted; spawn-overhead assumption refuted in practice; partitioned-bucket
+token waste confirmed directionally (pools waste 1.4–3× more than the
+shared bucket); queue-depth hostage effect not separable at quota scale
+(all candidates equal once the AIMD trajectory is conditioned on); CPU
+affinity advantage of pools did not materialize (pools cost MORE CPU).
+The bullet list below is kept as the historical record of what was in
+question and why.**
+
+These were **unverified performance hypotheses** settled by measurement,
+not intuition. The detailed experiment design lives in
+`benchmark-plan.md`; this section records what was in question and why.
 
 - **Task-per-request vs fixed worker pool**: the task-per-request model
   (spawn one tokio task per BatchWriteItem request, bounded by a semaphore,
@@ -358,6 +375,49 @@ rules). Summary:
 - Close the losing branch when Q5 is settled
 
 ## 6. Empirical Findings
+
+### 2026-07-11 (Tier-1 EC2 benchmark complete — task (C) adopted)
+
+Tier-1 sweep finished on real DynamoDB at account-quota scale (m9g.xlarge,
+us-west-2; Stage 1 = w10 full matrix run `20260707-152019`, Stage 2 =
+quota-only 39k-WCU matrix run `20260711-140009`, 24/24 reps exit 0, ~$1
+real spend). Full numbers: `benchmark-plan.md` §7 scoring and
+`scripts/bench/out/20260711-140009/` (+ S3 `runs/20260711-140009/`,
+run-notes.md included).
+
+- **Decision: consolidate on candidate C (task-per-request + shared bucket
+  + governor-capped in-flight)**. No candidate hit a disqualifying
+  regression; C is best-or-tied on throughput in every regime and
+  uniformly best on token waste (31–78k vs pools' 55–124k), CPU
+  (e.g. small: 117k items/cpu-s vs pool16 85k / pool1 65k) and RSS
+  (21–61MB vs pool16's up to 152MB). The §7 simplicity tiebreak also
+  favors C. This lands the §5.3 prediction that spawn overhead is
+  negligible against 5–50ms network calls.
+- **The unification criterion — "every executor reaches the AIMD target" —
+  is met with direct evidence**: over all 24 quota reps, per-second
+  consumed/target adherence during the saturated period was 0.997–1.001
+  (mean) and ≥0.935 (P5); on the highest plateau AIMD ever requested
+  (41,527 items/s small / 37,752 WCU/s mixed·large) every executor
+  sustained ≥0.977 (mostly ≥0.993) for the full 10–46s plateau. No
+  executor was ever the bottleneck; the ceiling was DynamoDB's.
+- **Throughput differences between candidates in the mixed regime were
+  entirely the AIMD "throttle lottery"**: 6/8 mixed reps rode an identical
+  trajectory (probe → partition-level throttle at t≈165s → halve →
+  recover) and landed within 0.1% of each other (9,280–9,287 items/s);
+  the two outliers (mpmc rep1 throttled at t=76s; task rep2 throttled
+  twice) match their mean-target integrals exactly. Conditioned on the
+  trajectory, the four executors are indistinguishable.
+- **Throttling at quota scale is partition-granular** (`WriteKeyRange…`):
+  a 39k-WCU table has ~40 partitions × 1,000 WCU/s hard cap, so at ≥95%
+  of provisioned the per-second multinomial fluctuation alone crosses a
+  partition cap (throttles observed at target 37,752 = 97% of
+  provisioned). Uniform hashed keys (`item-{index:08d}`) do not prevent
+  this; mixed 35-WCU items make it lumpier. Symmetric across candidates;
+  flag reps with `throttled>0` when comparing means.
+- Operational: pool1-mixed 2/2 at quota scale confirms the §4.13 deadlock
+  fix under real load. DynamoDB CloudWatch quirk recorded: consumed-metric
+  zero datapoints are backfilled ~8–9 min before CreateTable — use
+  CloudTrail, not metrics, for existence timelines.
 
 ### 2026-07-05 (benchmark preparation)
 
@@ -422,7 +482,7 @@ rules). Summary:
 1. ~~Build the experiment environment, reproduce the stall, fix item accounting~~ (done)
 2. ~~Minimal AIMD (fast loop only) + progress deadline + effective-target-based scale-out decisions~~ (done; §4.6, §4.8)
 3. ~~CloudWatch slow control loop (informed recovery)~~ (done; §4.7)
-4. Settle the executor/chunker architecture via benchmark (§5.4, `benchmark-plan.md`) ← next
+4. ~~Settle the executor/chunker architecture via benchmark~~ (done 2026-07-11; §6, verdict = task (C), unification in progress) ← **current: consolidate the implementation on C, delete pool/mpmc paths**
 5. Foundation generalization: resource vectorization (§5.1), move generic parts of `BatchWriteProcess` into algo, reduce `expect`s, scale-in
 6. ~~Finish import: streaming file reads + semaphore admission control (§5.2 → §4.11), `--max-wcu` CLI option (§4.12)~~ (done)
 7. Parallel scan for export (RCU variant, separate branch)

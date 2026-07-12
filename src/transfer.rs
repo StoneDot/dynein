@@ -1240,7 +1240,7 @@ async fn stream_writes_with_chucked(
         admission: Arc<tokio::sync::Semaphore>,
     }
 
-    impl algo::worker::ResourceConstraintProcess for BatchWriteProcess {
+    impl algo::task_executor::ResourceConstraintProcess for BatchWriteProcess {
         fn estimate_resource(&self) -> f64 {
             let mut total_estimate = 0.0;
             for reqs in self.write_items.values() {
@@ -1264,7 +1264,7 @@ async fn stream_writes_with_chucked(
             total_estimate
         }
 
-        async fn process_and_consume_resource(&self) -> algo::worker::ProcessResult {
+        async fn process_and_consume_resource(&self) -> algo::task_executor::ProcessResult {
             let result = self
                 .ddb
                 .batch_write_item()
@@ -1314,7 +1314,7 @@ async fn stream_writes_with_chucked(
                 self.admission.add_permits(resolved);
             }
 
-            algo::worker::ProcessResult {
+            algo::task_executor::ProcessResult {
                 consumed: summary.consumed_capacity,
                 throttled: summary.throttled,
             }
@@ -1323,12 +1323,10 @@ async fn stream_writes_with_chucked(
 
     // This channel is used to queue each a BatchWriteItem request.
     let (tx2, rx2) = tokio::sync::mpsc::channel::<BatchWriteProcess>(16);
-    // The executor architecture is selectable via DYNEIN_BENCH_EXECUTOR while
-    // the benchmark of docs/design/benchmark-plan.md is being settled.
-    let executor_kind = algo::executor::ExecutorKind::from_env();
-    info!("Using executor architecture {:?}", executor_kind);
-    let mut executor =
-        algo::executor::AnyExecutor::new(executor_kind, rx2, max_wcu, hints.initial_wcu);
+    // Task-per-request executor with a shared bucket — adopted as the sole
+    // architecture by the Tier-1 benchmark (import-throttling.md §6). The
+    // benchmark-era candidates live at tag pre-task-unification-20260711.
+    let mut executor = algo::task_executor::TaskExecutor::new(rx2, max_wcu, hints.initial_wcu);
 
     // Start the slow control loop when a capacity reference is known. It
     // consults CloudWatch to recover more aggressively when it looks safe.
