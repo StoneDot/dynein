@@ -592,7 +592,7 @@ Safety nets:
   this run's CUR (UsageType `USW2-WriteCapacityUnit-Hrs`, UsageAmount per
   hour) and record the answer here**
   - **Answer (2026-07-07, Cost Explorer evidence; CUR line-item confirmation
-    pending — no CUR/Data Export existed in the account)**: provisioned
+    completed 2026-07-11, see below)**: provisioned
     capacity bills as integer unit-hours for **complete clock hours of table
     existence; partial hours are dropped, not rounded up**. Evidence: 52h
     after the 2026-07-05 runs, `USW2-WriteCapacityUnit-Hrs` shows **zero
@@ -612,3 +612,17 @@ Safety nets:
     NOTE: that is an on-instance code change → requires a fresh G2 canary.
     Keep preflight showing the worst-case interpretation until the CUR
     line items confirm; the behavior is undocumented and could change.
+  - **CUR line-item confirmation (2026-07-11, export `dynein-cur2`, billing
+    period 2026-07 covering 07-01..07-11)**: zero DynamoDB line items exist
+    for ANY `dynein-bench-*` table — including the 39k-WCU table of 07-05
+    (alive 38 min across the 10:00 clock boundary) and the 1000-WCU canary
+    tables of 07-05/07-07/07-08 — while the same file records APN1
+    long-lived tables' capacity unit-hours as exact integers (free-tier
+    priced at $0 but with non-zero usage amounts) and the 07-05 bench EC2
+    usage ($0.94). Partial clock hours produce **no usage record at all**,
+    not a $0-priced record. Model confirmed: only complete clock hours of
+    table existence bill. **Prorated is a strict upper bound of this model**
+    (complete hours ≤ lifetime/1h), so preflight now gates on prorated ≤
+    budget and demotes the refuted hour-rounded number to informational
+    (preflight.sh cost gate, changed 2026-07-11; launch.sh gained
+    --budget-usd pass-through). Fresh-per-rep stays the table strategy.

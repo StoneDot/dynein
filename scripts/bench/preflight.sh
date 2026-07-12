@@ -166,7 +166,13 @@ check(concurrent_wcu <= 78000,
       f"worst-case concurrent provisioned WCU {concurrent_wcu} <= 78000 "
       f"(80k account quota minus residual headroom)")
 
-# Cost under both billing interpretations (USD, us-west-2 rate).
+# Cost gate: prorated WCU-seconds vs budget. Prorated is a strict upper
+# bound of the confirmed billing model (only complete clock hours of table
+# existence produce usage records; partial hours bill nothing — CUR
+# line-item evidence 2026-07-11, benchmark-plan.md §8), so it is safe to
+# gate on without blocking sub-hour fresh-per-rep runs. The hour-rounded
+# interpretation (every short-lived table bills a full table-hour) was
+# refuted by the same evidence and stays visible as INFO only.
 RATE = 0.00065
 prorated = 0.0
 hour_rounded = 0.0
@@ -174,10 +180,10 @@ for c in cfg["cells"]:
     secs = (c.get("budget_secs", 600) + 120) * c["reps"]
     prorated += c["wcu"] * RATE * secs / 3600
     hour_rounded += c["wcu"] * RATE * max(1.0, secs / 3600 + 1)
-print(f"INFO  cost estimate: prorated ~${prorated:.0f} / hour-rounded worst ~${hour_rounded:.0f} "
-      f"(budget ${budget:.0f})")
-check(hour_rounded <= budget,
-      f"worst-case cost ${hour_rounded:.0f} within budget ${budget:.0f}")
+print(f"INFO  cost estimate: prorated ~${prorated:.0f} (gated) / hour-rounded ~${hour_rounded:.0f} "
+      f"(refuted, informational) (budget ${budget:.0f})")
+check(prorated <= budget,
+      f"prorated worst-case cost ${prorated:.0f} within budget ${budget:.0f}")
 sys.exit(fail)
 PYEOF
 [ $? -ne 0 ] && FAIL=1

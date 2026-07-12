@@ -14,7 +14,7 @@
 #       --bucket dynein-bench-<account-id> \
 #       [--run-id ID] [--region ap-northeast-1] [--commit SHA] \
 #       [--instances-per-type N] [--iam-profile dynein-bench-instance] \
-#       [--quota-wcu 40000] [--out-dir DIR] \
+#       [--quota-wcu 40000] [--out-dir DIR] [--budget-usd N] \
 #       [--canary] [--skip-canary-check] [--skip-preflight]
 #
 # GATES (postmortem G1/G2): with --execute this script mechanically enforces
@@ -61,6 +61,9 @@ KEY_NAME="${BENCH_KEY_NAME:-}"
 CANARY=0
 SKIP_CANARY_CHECK=0
 SKIP_PREFLIGHT=0
+# Agreed spend ceiling forwarded to preflight's cost gate (empty = preflight
+# default). Pass the SAME number to watchdog.sh --budget-usd after launch.
+BUDGET_USD=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -79,6 +82,7 @@ while [ $# -gt 0 ]; do
         --security-group) SECURITY_GROUP="$2"; shift ;;
         --key-name) KEY_NAME="$2"; shift ;;
         --quota-wcu) QUOTA_WCU="$2"; shift ;;
+        --budget-usd) BUDGET_USD="$2"; shift ;;
         --out-dir) OUT_DIR="$2"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -238,7 +242,8 @@ if [ "$DRY_RUN" = "0" ]; then
         echo "gate G1: running preflight.sh"
         "$SCRIPT_DIR/preflight.sh" --config "$CONFIG" --region "$REGION" \
             --subnet-id "$SUBNET_ID" --security-group "$SECURITY_GROUP" \
-            --instance-types "$INSTANCE_TYPES" --iam-profile "$IAM_PROFILE" || {
+            --instance-types "$INSTANCE_TYPES" --iam-profile "$IAM_PROFILE" \
+            ${BUDGET_USD:+--budget-usd "$BUDGET_USD"} || {
             echo "ABORTED: preflight failed — fix the failures or pass --skip-preflight (human decision)" >&2
             exit 1
         }
