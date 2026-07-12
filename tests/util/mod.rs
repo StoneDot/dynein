@@ -20,6 +20,7 @@ use std::process::Command; // Run programs
                            // use assert_cmd::cmd::Command; // Run programs - it seems to be equal to "use assert_cmd::prelude::* + use std::process::Command"
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
+use aws_sdk_dynamodb::config::Credentials;
 use aws_sdk_dynamodb::Client as DynamoDbSdkClient;
 use once_cell::sync::Lazy;
 use rand::{distributions::Alphanumeric, Rng};
@@ -28,10 +29,11 @@ use serde_json::Value;
 use std::io::{self, Write}; // Used when check results by printing to stdout
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 // We use std::sync::Mutex instead of tokio::sync::Mutex, because mutex must be poisoned after setup failure.
+// (SETUP_DOCKER_RUN_MUTEX is the exception: it deliberately recovers from poison — see setup_container.)
 static SETUP_LOCK: Lazy<RwLock<()>> = Lazy::new(|| RwLock::new(()));
 static SETUP_DOCKER_RUN_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -240,8 +242,11 @@ pub async fn setup() -> Result<TestManager<'static>, Box<dyn std::error::Error>>
     setup_with_port(8000).await
 }
 
-// The guard is intentionally held across await and moved into TestManager to
-// serialize tests. Tests run on dedicated OS threads, so blocking is acceptable.
+// The guard is intentionally held across await points and beyond: it is stored in
+// TestManager to give the test shared (read) access for its whole lifetime, while
+// setup_with_lock takes exclusive (write) access. This is safe because every
+// #[tokio::test] runs on its own single-threaded runtime, so blocking on the lock
+// never starves another test's executor.
 #[allow(clippy::await_holding_lock)]
 pub async fn setup_with_port(
     port: i32,
@@ -259,7 +264,7 @@ pub async fn setup_with_port(
     })
 }
 
-// See setup_with_port for why holding the guard across await is fine here.
+// See setup_with_port for why holding the guard across await points is intended.
 #[allow(clippy::await_holding_lock)]
 pub async fn setup_with_lock() -> Result<TestManager<'static>, Box<dyn std::error::Error>> {
     let lock = SETUP_LOCK.write().unwrap();
@@ -316,68 +321,99 @@ async fn setup_container(port: i32) -> Result<(), Box<dyn std::error::Error>> {
     // Check the current process at first to allow multiple threads to run tests concurrently.
     // This is for performance optimization on Windows and Mac OS.
     // See https://github.com/awslabs/dynein/pull/28#issuecomment-972880324 for detail.
-    if check_dynamodb_local_running(port as u16) {
-        return Ok(());
-    };
+    if !check_dynamodb_local_running(port as u16) {
+        // To avoid unnecessary docker container creation, setup docker sequentially.
+        // The guard is scoped to this blocking section so it is never held across an
+        // await point. A poisoned lock (another test panicked during setup) still
+        // provides mutual exclusion, and the docker state is rechecked below, so it
+        // is safe to continue with the recovered guard.
+        let _lock = SETUP_DOCKER_RUN_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // To avoid unnecessary docker container creation, setup docker sequentially
-    let _lock = SETUP_DOCKER_RUN_MUTEX.lock();
-
-    // Recheck whether another thread already started the dynamodb-local
-    if check_dynamodb_local_running(port as u16) {
-        return Ok(());
+        // Recheck whether another thread already started the dynamodb-local
+        if !check_dynamodb_local_running(port as u16) {
+            let mut docker_for_run = Command::new("docker");
+            let docker_run = docker_for_run.args([
+                "run",
+                "-p",
+                &format!("{}:8000", port),
+                "-d",
+                "amazon/dynamodb-local",
+            ]);
+            let output = docker_run
+                .output()
+                .expect("failed to running Docker image amazon/dynamodb-local in setup().");
+            if !output.status.success() {
+                panic!("failed to execute docker run command")
+            }
+            print!("DynamoDB Local is up as a container: ");
+            io::stdout().write_all(&output.stdout).unwrap();
+            io::stderr().write_all(&output.stderr).unwrap();
+        }
     }
 
-    let mut docker_for_run = Command::new("docker");
-    let docker_run = docker_for_run.args([
-        "run",
-        "-p",
-        &format!("{}:8000", port),
-        "-d",
-        "amazon/dynamodb-local",
-    ]);
-    let output = docker_run
-        .output()
-        .expect("failed to running Docker image amazon/dynamodb-local in setup().");
-    if !output.status.success() {
-        panic!("failed to execute docker run command")
-    }
-    print!("DynamoDB Local is up as a container: ");
-    io::stdout().write_all(&output.stdout).unwrap();
-    io::stderr().write_all(&output.stderr).unwrap();
+    // The container being listed by `docker ps` only proves liveness; the JVM inside
+    // may still be starting and refusing connections for several seconds. Every test
+    // waits for an actual API success here, so a test is never handed an endpoint that
+    // is not ready yet, regardless of which test executed `docker run`. Once the
+    // endpoint is up this costs a single immediate ListTables call.
+    wait_dynamodb_local_ready(port).await;
 
-    // Wait dynamodb-local
-    // https://docs.aws.amazon.com/sdk-for-rust/latest/dg/dynamodb-local.html
+    Ok(())
+}
+
+/// Wait until DynamoDB Local actually responds to an API call on the given port.
+/// https://docs.aws.amazon.com/sdk-for-rust/latest/dg/dynamodb-local.html
+async fn wait_dynamodb_local_ready(port: i32) {
     let config = aws_sdk_dynamodb::config::Builder::from(
         &SdkConfig::builder()
             .region(Region::new("local"))
             .behavior_version(BehaviorVersion::v2026_01_12())
             .build(),
     )
+    // Dummy credentials are required even for the readiness probe: without a
+    // credentials provider every request fails client-side with
+    // NoMatchingAuthSchemeError before reaching the endpoint, so readiness
+    // would never be observed. DynamoDB Local accepts arbitrary credentials;
+    // the values match the ones command() injects into dy processes.
+    .credentials_provider(Credentials::new("test", "test", None, None, "dynein-test"))
     .endpoint_url(format!("http://localhost:{}", port))
     .build();
     let ddb = DynamoDbSdkClient::from_conf(config);
-    let max_retries = 5;
-    let mut attempts = 0;
-    loop {
-        match ddb.list_tables().send().await {
-            Ok(_result) => {
-                println!("ListTables API succeeded.");
-                break;
-            }
-            Err(e) => {
-                println!("Couldn't connect: {} \n Retry after 3 seconds.", e);
-                sleep(Duration::from_secs(3)).await;
 
-                attempts += 1;
-                if attempts >= max_retries {
-                    panic!("Failed to connect after {} attempts.", max_retries);
-                }
+    // Bound the wait by wall-clock time, not retry count: attempt duration varies
+    // with the failure mode (instant refusal vs. seconds of connect timeout), so N
+    // retries give an unpredictable budget.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_failure = String::from("no attempt was made");
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "DynamoDB Local on port {} did not become ready within 60 seconds. Last failure: {}",
+                port, last_failure
+            );
+        }
+        // The 5s cap keeps a hung attempt from stalling the wait indefinitely; the
+        // remaining-budget cap keeps the overall wait from overshooting the deadline.
+        let attempt_timeout = remaining.min(Duration::from_secs(5));
+        match tokio::time::timeout(attempt_timeout, ddb.list_tables().send()).await {
+            Ok(Ok(_result)) => {
+                println!("DynamoDB Local is ready: ListTables API succeeded.");
+                return;
+            }
+            Ok(Err(e)) => {
+                last_failure = format!("{:?}", e);
+                println!("DynamoDB Local is not ready yet: {}", last_failure);
+            }
+            Err(_elapsed) => {
+                last_failure = format!("request timed out after {:?}", attempt_timeout);
+                println!("DynamoDB Local is not ready yet: {}", last_failure);
             }
         }
+        sleep(Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now()))).await;
     }
-
-    Ok(())
 }
 
 pub struct TemporaryItem {
