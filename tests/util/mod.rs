@@ -240,6 +240,9 @@ pub async fn setup() -> Result<TestManager<'static>, Box<dyn std::error::Error>>
     setup_with_port(8000).await
 }
 
+// The guard is intentionally held across await and moved into TestManager to
+// serialize tests. Tests run on dedicated OS threads, so blocking is acceptable.
+#[allow(clippy::await_holding_lock)]
 pub async fn setup_with_port(
     port: i32,
 ) -> Result<TestManager<'static>, Box<dyn std::error::Error>> {
@@ -256,6 +259,8 @@ pub async fn setup_with_port(
     })
 }
 
+// See setup_with_port for why holding the guard across await is fine here.
+#[allow(clippy::await_holding_lock)]
 pub async fn setup_with_lock() -> Result<TestManager<'static>, Box<dyn std::error::Error>> {
     let lock = SETUP_LOCK.write().unwrap();
     setup_container(8000).await?;
@@ -346,7 +351,7 @@ async fn setup_container(port: i32) -> Result<(), Box<dyn std::error::Error>> {
     let config = aws_sdk_dynamodb::config::Builder::from(
         &SdkConfig::builder()
             .region(Region::new("local"))
-            .behavior_version(BehaviorVersion::v2024_03_28())
+            .behavior_version(BehaviorVersion::v2026_01_12())
             .build(),
     )
     .endpoint_url(format!("http://localhost:{}", port))

@@ -21,7 +21,7 @@ use predicates::prelude::*; // Used for writing assertions
 async fn test_admin_delete_non_existent_table() -> Result<(), Box<dyn std::error::Error>> {
     let tm = util::setup_with_lock().await?;
     let mut c = tm.command()?;
-    let cmd = c.args(&[
+    let cmd = c.args([
         "--region",
         "local",
         "admin",
@@ -46,7 +46,7 @@ async fn test_admin_delete_existent_table() -> Result<(), Box<dyn std::error::Er
     let table_name = tm.create_temporary_table("pk", None).await?;
     let mut c = tm.command()?;
 
-    let cmd = c.args(&[
+    let cmd = c.args([
         "--region",
         "local",
         "admin",

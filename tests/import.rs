@@ -47,9 +47,9 @@ async fn test_import_json() -> Result<(), Box<dyn std::error::Error>> {
                 "-t",
                 &tbl,
                 "-f",
-                &format,
+                format,
                 "-i",
-                &temp_path.to_str().unwrap(),
+                temp_path.to_str().unwrap(),
             ])
             .assert()
             .success()
@@ -102,7 +102,7 @@ async fn test_import_csv() -> Result<(), Box<dyn std::error::Error>> {
             "-f",
             "csv",
             "-i",
-            &temp_path.to_str().unwrap(),
+            temp_path.to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -153,7 +153,7 @@ async fn test_import_jsonl() -> Result<(), Box<dyn std::error::Error>> {
             "-f",
             "jsonl",
             "-i",
-            &temp_path.to_str().unwrap(),
+            temp_path.to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -204,7 +204,7 @@ async fn test_import_jsonl_with_set_inference() -> Result<(), Box<dyn std::error
             "-f",
             "jsonl",
             "-i",
-            &temp_path.to_str().unwrap(),
+            temp_path.to_str().unwrap(),
             "--enable-set-inference",
         ])
         .assert()

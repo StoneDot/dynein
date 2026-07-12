@@ -30,9 +30,12 @@ name = "dy"
 path = "src/main.rs"
 
 [dependencies]
-aws-config       = "1.5.12"
-aws-sdk-dynamodb = "1.28.0"
-aws-sdk-ec2      = "1.42.0"
+aws-config       = "1.9.0"
+# default-features = false drops the legacy TLS stack (rustls 0.21 / rustls-webpki 0.101),
+# which has RUSTSEC advisories without a fix. The default HTTPS client does not use it
+# as long as we stay on BehaviorVersion::v2026_01_12() or later (see src/app.rs).
+aws-sdk-dynamodb = { version = "1.117.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ec2      = { version = "1.240.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-runtime-api = "1.6.0"
 aws-smithy-types = "1.1.9"
 chrono           = "0.4"

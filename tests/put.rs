@@ -353,7 +353,7 @@ async fn test_put_same_pk() -> Result<(), Box<dyn std::error::Error>> {
     }]
     "#;
 
-    util::assert_eq_cmd_json(get_cmd, &expected);
+    util::assert_eq_cmd_json(get_cmd, expected);
     Ok(())
 }
 
@@ -390,7 +390,7 @@ async fn test_multiple_put_same_pk() -> Result<(), Box<dyn std::error::Error>> {
     }]
     "#;
 
-    util::assert_eq_cmd_json(get_cmd, &expected);
+    util::assert_eq_cmd_json(get_cmd, expected);
     Ok(())
 }
 

@@ -51,7 +51,7 @@ async fn test_config_clear() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = tm.command()?;
     let cmd = c.args(["config", "clear"]);
     cmd.assert().success();
-    util::check_dynein_files_existence(&config_dir, false);
+    util::check_dynein_files_existence(config_dir, false);
 
     let mut c = tm.command()?;
     let cmd = c.args(["config", "dump"]);

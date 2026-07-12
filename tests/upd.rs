@@ -231,10 +231,7 @@ async fn test_upd_fibonacci() -> Result<(), Box<dyn std::error::Error>> {
             .stdout(
                 predicate::str::contains("pk1")
                     .and(predicate::str::contains("n1"))
-                    .and(predicate::str::contains(&format!(
-                        "{}",
-                        fib_sequence[i + 2]
-                    ))), // +2 because we start from third element
+                    .and(predicate::str::contains(format!("{}", fib_sequence[i + 2]))), // +2 because we start from third element
             );
     }
 
