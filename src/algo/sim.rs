@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-//! Deterministic in-process simulation of the executor candidates
-//! (`docs/design/benchmark-plan.md` §2.5).
+//! Deterministic in-process simulation of the executor
+//! (originally the benchmark candidate comparison; the benchmark plan is
+//! archived at tag `pre-task-unification-20260711`).
 //!
 //! Everything here runs under tokio virtual time
 //! (`#[tokio::test(start_paused = true)]`): the algo layer uses
@@ -144,7 +145,7 @@ pub fn compute_scenario_result(
 
 #[cfg(test)]
 mod scenarios {
-    //! The regime scenarios of benchmark-plan.md §2.5, run manually with
+    //! The benchmark-era regime scenarios, run manually with
     //! `cargo test --bin dy sim_ -- --ignored --nocapture`.
     //!
     //! Originally a four-candidate comparison harness; since the Tier-1

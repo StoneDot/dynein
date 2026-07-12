@@ -1,9 +1,14 @@
 # Design Document: Throttled Import/Export Foundation for dynein
 
 - Status: Draft (design record for the wip branch `improve-export-import`)
-- Last updated: 2026-07-05
+- Last updated: 2026-07-11
 - Target branch: `improve-export-import` (source of truth: remote `my/improve-export-import`)
-- Related experimental branch: `improve-export-import-async-channel-queue` (8 parallel chunkers; benchmark not settled yet)
+- **Experiment archive**: the benchmark plan, the disposable-fleet harness
+  (`scripts/bench/`), the postmortems and the deadlock analysis referenced in
+  this document are deliberately excluded from the pull request. They are
+  preserved in full at tag **`pre-task-unification-20260711`** (raw run
+  artifacts additionally in S3). This document keeps only the decisions and
+  the evidence that justifies them.
 
 This document records the design decisions already implemented with their rationale, as well as **surrounding decisions that are not implemented yet but constrain future design** (congestion control, multi-table support, admission control, etc.). The goal is that the next person or agent touching this code can pick up the design philosophy without rediscovering it.
 
@@ -23,18 +28,19 @@ This document records the design decisions already implemented with their ration
 ## 2. Architecture Overview
 
 ```
-producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process ch: bounded 16] ──▶ ThrottledExecutor
-(streaming file reader,                   ▲                                          │ round-robin
- 1 admission permit/item)                 │                                          ▼
-                                          └──── [retry ch: unbounded] ◀──── workers (per-worker Bucket)
-                                                     (items keep their permit)       │ (resolve ⇒ return permits)
-                                                                                     ▼
-                                                                                BatchWriteItem
+producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process ch: bounded 16] ──▶ TaskExecutor
+(streaming file reader,                   ▲                                        │ shared Bucket pacing;
+ 1 admission permit/item)                 │                                        │ 1 tokio task per request,
+                                          │                                        │ in-flight cap grown by
+                                          └──── [retry ch: unbounded] ◀── request tasks
+                                                     (items keep their permit)     │ (resolve ⇒ return permits)
+                                                                                   ▼
+                                                                              BatchWriteItem
 ```
 
 - **`src/algo/bucket.rs`** — Token bucket. Consumes the estimated amount up front and corrects the difference against the actually consumed amount via `feedback(estimate - actual)`
 - **`src/algo/monitor.rs`** — `Probe` (sends observations) / `Monitor` (statistical throughput judgement using mean + standard deviation)
-- **`src/algo/worker.rs`** — `ThrottledWorker` (waits on the bucket, then processes) and `ThrottledExecutor` (round-robin distribution, automatic scale-out when the target is missed). The workload is abstracted behind the `ResourceConstraintProcess` trait (`estimate_resource` / `process_and_consume_resource`) and is **DynamoDB-agnostic**
+- **`src/algo/task_executor.rs`** — `TaskExecutor`: acquires tokens from a **single shared bucket**, then spawns one tokio task per BatchWriteItem request; the in-flight cap starts at 1 and doubles under `src/algo/governor.rs` (`ScaleOutGovernor`) while throughput lags the effective target and growing demonstrably helps. Chosen over fixed worker-pool architectures by the Tier-1 benchmark (§6 2026-07-11). The workload is abstracted behind the `ResourceConstraintProcess` trait (`estimate_resource` / `process_and_consume_resource`) and is **DynamoDB-agnostic**
 - **`src/ddb/item.rs`** — Item size → WCU estimation based on the heuristics in the official documentation
 - **`src/transfer.rs`** — Pipeline assembly (`stream_writes_with_chucked`). It takes a push-based source of `WriteRequest`s (a closure receiving a sink; §4.11), so json/jsonl/csv all go through this path while streaming from the file
 
@@ -75,6 +81,12 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 
 ### 4.5 Bucket feedback and worker partitioning
 
+**Note (2026-07-11)**: the worker partitioning described here belonged to the
+pool executor, which was removed when the implementation consolidated on the
+task executor (§6): a single shared bucket now paces all requests, so the
+even-split uniformity assumption and its multi-table concern (§5.3) are gone
+by construction. The feedback mechanism itself carries over unchanged.
+
 - Estimates are consumed up front; the difference against the measured consumption (sum of `consumed_capacity`) is refunded or charged. Introduced as the countermeasure to "wobbly WCU consumption"
 - The executor splits the target rate evenly as `target_limit / num_workers`, and each worker looks only at its own bucket (lock-free). This rests on **the assumption that traffic is uniform across workers**. Multi-table support may make this assumption too strong (§5.3)
 - Scale-out doubles the worker count when measured throughput is statistically (3σ) below the target. `1f2d0a2` added over-scale-out suppression. In addition, scale-out decisions now use the AIMD *effective* target and are frozen entirely while the congestion controller is backing off, which fixes "scaling out in the wrong direction when throttling is the reason the target is missed" (§4.6)
@@ -87,7 +99,7 @@ producer ──▶ [main ch: bounded 500] ──▶ chunker ──▶ [process c
 - **Initial effective target from known information**: instead of starting blind at the ceiling, `capacity_hints()` (transfer.rs) derives a realistic starting point: provisioned tables start at **80% of the provisioned WCU** (leaving headroom for production from the beginning), on-demand tables at the **table's actual warm throughput** (`TableDescription::warm_throughput.write_units_per_second` — readable since the 2026-07-05 rebase onto upstream main brought aws-sdk-dynamodb 1.93; the platform default 4,000 remains the fallback when DescribeTable does not report it, and no 80%-style ratio is applied because warm throughput is already "instantly absorbable" capacity, not an entitlement to protect). **Empirical note (2026-07-05, ap-northeast-1)**: despite the documentation saying every table has warm throughput values, DescribeTable returned `WarmThroughput: null` both for a freshly created on-demand table and for a long-lived provisioned one — the field appears to be populated only when warm throughput was explicitly set. In practice the fallback covers default tables and the readout matters for tables with purchased warm throughput. The same gradual recovery then probes upward from the initial value toward the ceiling
 - **`is_congested` semantics**: "a throttle event was observed within the last calm period" — used to freeze scale-out. Starting below the ceiling due to an initial target is *not* congestion (otherwise scale-out would be frozen from the start)
 - **Congestion signal definition** (decided in `summarize_batch_write_result`): a request is "throttled" when the whole request was rejected with `ProvisionedThroughputExceededException` / `RequestLimitExceeded`, or when **at least one** of its items came back unprocessed. Every unprocessed item is a server-side rejection due to a capacity shortage, so for production-workload protection even a single one counts (a majority-based threshold was considered and rejected as too lenient). The decrease cooldown keeps this strictness from over-reacting, at the cost of the steady state possibly sitting somewhat below the entitlement — accepted as the intended production-first policy; revisit with benchmark data if it proves too conservative. `InternalServerError` is retryable but is *not* a congestion signal
-- **Wiring**: `ResourceConstraintProcess::process_and_consume_resource` returns `ProcessResult { consumed, throttled }` (the minimal observation-type extension; the keyed generalization of §5.1 remains). Workers record outcomes into `CongestionStats` (two shared atomics — no extra channels); the executor reads deltas on each run-loop iteration, feeds the controller, and broadcasts new per-worker rates via the pre-existing `Signal::ChangeRefill` / `ChangeMaxCap`
+- **Wiring**: `ResourceConstraintProcess::process_and_consume_resource` returns `ProcessResult { consumed, throttled }` (the minimal observation-type extension; the keyed generalization of §5.1 remains). Request tasks record outcomes into `CongestionStats` (two shared atomics — no extra channels); the executor reads deltas on each run-loop iteration, feeds the controller, and applies new targets to the shared bucket directly (until the 2026-07-11 unification this traveled per-worker `Signal::ChangeRefill` / `ChangeMaxCap` channels; see §4.13)
 - **Interaction with scale-out**: decisions compare against the effective target, and scale-out is frozen while congested
 - **Caveat**: the controller only ticks when messages flow through the executor. Under total silence it does not tick, but in that situation there is nothing to pace either; the progress deadline (§4.8) covers pathological cases
 
@@ -265,7 +277,7 @@ is a load-bearing invariant for any future queue-based executor.
   in the sole slot at `queue_depth == 1` while the dispatcher was parked on
   `notifier.notified()` waiting for a completion that would never arrive —
   deadlock. Candidate A′ (`pool1`) wedged 3/3 on the Stage 1 mixed cells because
-  of this; full analysis in [pool1-deadlock-analysis.md](pool1-deadlock-analysis.md).
+  of this; full analysis in pool1-deadlock-analysis.md (see the experiment archive tag).
   The defect was latent at every depth; depth 1 merely removed the buffer slack
   that hid it.
 - **Why this shape, not moving the wakeup to dequeue**: keeping `notify_one()` on
@@ -353,11 +365,11 @@ not intuition. The detailed experiment design lives in
   have workers query a "capacity provider" abstraction so the design can
   fall either way
 
-### 5.4 Phase 3 benchmark plan
+### 5.4 Phase 3 benchmark plan — executed, see §6 (2026-07-11)
 
-**See `benchmark-plan.md` for the full experiment design** (candidates,
+**The full experiment design lived in `benchmark-plan.md`** (candidates,
 workload matrix, metrics, EC2/S3 disposable-fleet infrastructure, decision
-rules). Summary:
+rules; archived at the experiment archive tag). Summary:
 
 - Candidates: A = current pool (queue 16), A′ = pool with queue depth 1,
   C = task-per-request + shared bucket; B (shared MPMC queue + pool) held in
@@ -381,9 +393,9 @@ rules). Summary:
 Tier-1 sweep finished on real DynamoDB at account-quota scale (m9g.xlarge,
 us-west-2; Stage 1 = w10 full matrix run `20260707-152019`, Stage 2 =
 quota-only 39k-WCU matrix run `20260711-140009`, 24/24 reps exit 0, ~$1
-real spend). Full numbers: `benchmark-plan.md` §7 scoring and
-`scripts/bench/out/20260711-140009/` (+ S3 `runs/20260711-140009/`,
-run-notes.md included).
+real spend). Full numbers: the benchmark plan's §7 scoring and the raw
+results, both preserved at the experiment archive tag (+ S3
+`runs/20260711-140009/`, run-notes.md included).
 
 - **Decision: consolidate on candidate C (task-per-request + shared bucket
   + governor-capped in-flight)**. No candidate hit a disqualifying

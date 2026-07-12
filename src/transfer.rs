@@ -760,7 +760,8 @@ async fn slow_control_loop(
 /// Environment variable enabling the benchmark stats emitter: when set to a
 /// file path, a JSON line of cumulative counters is appended every second.
 /// Machine-readable by design — the benchmark harness must not parse human
-/// logs (docs/design/benchmark-plan.md §4).
+/// logs (used by the executor benchmark, archived at tag
+/// `pre-task-unification-20260711`; kept as a lightweight observability hook).
 const BENCH_STATS_ENV: &str = "DYNEIN_BENCH_STATS";
 
 /// Interval between two benchmark stats lines.
@@ -1165,7 +1166,7 @@ fn stream_csv_rows<R: std::io::BufRead>(
 /// the producer feeds (e.g. the task-per-request candidate with ample
 /// tokens) would otherwise turn every `recv_many` remainder into a partial
 /// BatchWriteItem request — measured as 21.4 items/request and +17%
-/// requests on DynamoDB Local (benchmark-plan.md §2.7). Waiting costs
+/// requests on DynamoDB Local (observed on DynamoDB Local during the executor benchmark). Waiting costs
 /// nothing downstream because the token bucket paces requests anyway.
 /// Cancel-safe: items received before cancellation stay in `items`.
 async fn fill_to_capacity(

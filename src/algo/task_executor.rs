@@ -24,7 +24,7 @@
 //!
 //! This was candidate C of the executor benchmark and was adopted as the
 //! sole architecture after the Tier-1 EC2 sweep (import-throttling.md §6,
-//! 2026-07-11; benchmark-plan.md §7): best-or-tied throughput in every
+//! 2026-07-11): best-or-tied throughput in every
 //! regime with the lowest token waste, CPU and RSS, and direct evidence
 //! that it sustains the AIMD target wherever the pools did. The rejected
 //! candidates (fixed worker pools, shared-MPMC pool) and the runtime
