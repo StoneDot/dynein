@@ -360,4 +360,105 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn test_attr_size_scalar_types() {
+        use aws_smithy_types::Blob;
+        // String: UTF-8 byte length ("あ" is 3 bytes).
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::S("abc".into())),
+            Ok(3)
+        );
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::S("aあ".into())),
+            Ok(4)
+        );
+        // Number: ceil(significant digits / 2) + 1.
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::N("0".into())),
+            Ok(1)
+        );
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::N("1".into())),
+            Ok(2)
+        );
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::N("99".into())),
+            Ok(2)
+        );
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::N("101".into())),
+            Ok(3)
+        );
+        // Bool and Null occupy one byte each.
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::Bool(true)),
+            Ok(1)
+        );
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::Null(true)),
+            Ok(1)
+        );
+        // Binary: raw byte length.
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::B(Blob::new(b"xyz".to_vec()))),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn test_attr_size_sets_sum_their_elements() {
+        use aws_smithy_types::Blob;
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::Ss(vec!["ab".into(), "c".into()])),
+            Ok(3)
+        );
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::Ns(vec!["1".into(), "99".into()])),
+            Ok(4)
+        );
+        assert_eq!(
+            calculate_estimated_attr_size(&AttributeValue::Bs(vec![
+                Blob::new(b"ab".to_vec()),
+                Blob::new(b"c".to_vec()),
+            ])),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn test_attr_size_list_and_map_have_container_overhead() {
+        // List: 3 bytes + (element size + 1) per element.
+        let list = AttributeValue::L(vec![
+            AttributeValue::S("ab".into()),
+            AttributeValue::Bool(true),
+        ]);
+        assert_eq!(
+            calculate_estimated_attr_size(&list),
+            Ok(3 + (2 + 1) + (1 + 1))
+        );
+        // Map: 3 bytes + (key length + value size + 1) per entry.
+        let map = AttributeValue::M(HashMap::from([(
+            "k".to_string(),
+            AttributeValue::S("ab".into()),
+        )]));
+        assert_eq!(calculate_estimated_attr_size(&map), Ok(3 + (1 + 2 + 1)));
+    }
+
+    #[test]
+    fn test_item_size_sums_attribute_names_and_values() {
+        let item = HashMap::from([
+            ("pk".to_string(), AttributeValue::S("ab".into())),
+            ("n".to_string(), AttributeValue::N("1".into())),
+        ]);
+        assert_eq!(calculate_estimated_item_size(&item), Ok((2 + 2) + (1 + 2)));
+    }
+
+    #[test]
+    fn test_attr_size_invalid_number_is_an_error() {
+        assert!(matches!(
+            calculate_estimated_attr_size(&AttributeValue::N("abc".into())),
+            Err(ItemSizeCalculationError::InvalidNumberFormat(_))
+        ));
+    }
 }

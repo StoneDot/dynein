@@ -161,13 +161,6 @@ pub async fn export(
     let ts: app::TableSchema = app::table_schema(cx).await;
     let format_str: Option<&str> = format.as_deref();
 
-    if ts.mode == table::Mode::Provisioned {
-        let msg = "WARN: For the best performance on import/export, dynein recommends OnDemand mode. However the target table is Provisioned mode now. Proceed anyway?";
-        if !Confirm::new().with_prompt(msg).interact()? {
-            app::bye(0, "Operation has been cancelled.");
-        }
-    }
-
     // Basically given_attributes would be used, but on CSV format, it can be overwritten by suggested attributes
     let attributes: Option<String> = match format_str {
         Some("csv") => {
@@ -330,13 +323,6 @@ pub async fn import(
     let format_str: Option<&str> = format.as_deref();
 
     let ts: app::TableSchema = app::table_schema(cx).await;
-    if ts.mode == table::Mode::Provisioned {
-        let msg = "WARN: For the best performance on import/export, dynein recommends OnDemand mode. However the target table is Provisioned mode now. Proceed anyway?";
-        if !Confirm::new().with_prompt(msg).interact()? {
-            println!("Operation has been cancelled.");
-            return Ok(());
-        }
-    }
 
     // Items are streamed out of the file while the pipeline writes them, so
     // memory usage is bounded by the admission cap, not by the input size.
@@ -357,7 +343,7 @@ pub async fn import(
 
     match format_str {
         None | Some("json") | Some("json-compact") => {
-            stream_writes_with_chucked(
+            stream_writes_with_chunked(
                 cx,
                 move |sink| {
                     stream_json_array_items(std::io::BufReader::new(file), &mut |v| {
@@ -371,7 +357,7 @@ pub async fn import(
             .await?;
         }
         Some("jsonl") => {
-            stream_writes_with_chucked(
+            stream_writes_with_chunked(
                 cx,
                 move |sink| {
                     stream_jsonl_items(std::io::BufReader::new(file), &mut |v| {
@@ -385,7 +371,7 @@ pub async fn import(
             .await?;
         }
         Some("csv") => {
-            stream_writes_with_chucked(
+            stream_writes_with_chunked(
                 cx,
                 move |sink| {
                     stream_csv_rows(std::io::BufReader::new(file), enable_set_inference, sink)
@@ -1187,7 +1173,7 @@ async fn fill_to_capacity(
 /// through the sink it is given; the sink blocks on admission control and
 /// returns `Break` when the pipeline stops accepting items (abort), which
 /// the source must propagate by returning promptly.
-async fn stream_writes_with_chucked(
+async fn stream_writes_with_chunked(
     cx: &app::Context,
     source: impl FnOnce(
             &mut dyn FnMut(WriteRequest) -> ControlFlow<()>,
@@ -1651,7 +1637,8 @@ mod tests {
     use super::*;
     use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemOutput;
     use aws_sdk_dynamodb::types::error::{
-        ProvisionedThroughputExceededException, ResourceNotFoundException,
+        InternalServerError, ProvisionedThroughputExceededException, RequestLimitExceeded,
+        ResourceNotFoundException,
     };
     use aws_sdk_dynamodb::types::{ConsumedCapacity, PutRequest};
     use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
@@ -1802,6 +1789,56 @@ mod tests {
         assert_eq!(summary.successful_items, 0);
         assert_eq!(summary.failed_items, 2);
         assert!(summary.retry_requests.is_empty());
+    }
+
+    #[test]
+    fn test_summarize_internal_server_error_is_retried_without_congestion() {
+        let requested = requested_items(&["pk1", "pk2"]);
+        let err = SdkError::service_error(
+            BatchWriteItemError::InternalServerError(InternalServerError::builder().build()),
+            raw_http_response(),
+        );
+
+        let summary = summarize_batch_write_result(Err(err), &requested, false);
+
+        // Retryable, but a server-side issue is not a capacity shortage: it
+        // must not make the congestion controller back off.
+        assert_eq!(summary.successful_items, 0);
+        assert_eq!(summary.failed_items, 0);
+        assert_eq!(summary.retry_requests.len(), 2);
+        assert!(!summary.throttled);
+    }
+
+    #[test]
+    fn test_summarize_request_limit_exceeded_is_retried_as_congestion() {
+        let requested = requested_items(&["pk1", "pk2"]);
+        let err = SdkError::service_error(
+            BatchWriteItemError::RequestLimitExceeded(RequestLimitExceeded::builder().build()),
+            raw_http_response(),
+        );
+
+        let summary = summarize_batch_write_result(Err(err), &requested, false);
+
+        // An account-level request limit is a capacity shortage: retry all
+        // items and signal congestion so the controller backs off.
+        assert_eq!(summary.successful_items, 0);
+        assert_eq!(summary.failed_items, 0);
+        assert_eq!(summary.retry_requests.len(), 2);
+        assert!(summary.throttled);
+    }
+
+    #[test]
+    fn test_admission_item_cap_supports_batching_and_saturation() {
+        // Below one batch (25) admission would deadlock against the
+        // chunker's full-batch wait: the chunker waits for 25 items while
+        // admission refuses to let the 25th in.
+        assert!(ADMISSION_ITEM_CAP > 25);
+        // The cap must also cover the steady-state resident population at
+        // full saturation: main channel (500) + process channel (16
+        // batches) + the executor's in-flight growth ceiling (256
+        // requests), 25 items each. Otherwise admission, not capacity,
+        // becomes the throughput ceiling.
+        assert!(ADMISSION_ITEM_CAP >= 500 + (16 + 256) * 25);
     }
 
     #[test]

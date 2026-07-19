@@ -1153,6 +1153,14 @@ To import data into a table, you use with specified `--format` option. Here defa
 $ dy import --table target_movie --format json --input-file movie.json
 ```
 
+`dy import` writes items in parallel while pacing how much write capacity it consumes. When the table gets throttled, dynein slows down automatically to protect other applications working on the same table, then recovers gradually. If you want to set a hard limit on consumed capacity, use the `--max-wcu` option:
+
+```
+$ dy import --table target_movie --format json --input-file movie.json --max-wcu 500
+```
+
+Input files are read in a streaming manner, so memory usage stays low even for files larger than the available memory. If the import cannot complete — for example an invalid document in a JSON Lines file, a CSV row whose cell count does not match the header, or items that could not be written — dynein reports the error and exits with a non-zero status instead of skipping data silently.
+
 #### Enable set type inference
 
 Dynein provides the type inference for set types (number set, string set) for backward compatibility.

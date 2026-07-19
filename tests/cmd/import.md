@@ -4,8 +4,6 @@
 $ dy import --help
 Import items into a DynamoDB table from CSV/JSON file.
 
-If you want to achieve best performance, recommendated way is to switch the table to OnDemand mode before import. (e.g. dy admin update table your_table --mode ondemand).
-
 When you import items from a CSV file, header names are used to attributes for items. The first one or two column(s) would be primary key(s).
 
 Usage: dy import [OPTIONS] --input-file <INPUT_FILE>
@@ -55,8 +53,6 @@ Options:
 
 $ dy help import
 Import items into a DynamoDB table from CSV/JSON file.
-
-If you want to achieve best performance, recommendated way is to switch the table to OnDemand mode before import. (e.g. dy admin update table your_table --mode ondemand).
 
 When you import items from a CSV file, header names are used to attributes for items. The first one or two column(s) would be primary key(s).
 
