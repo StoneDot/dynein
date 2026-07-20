@@ -21,6 +21,7 @@ use aws_config::{
 use aws_sdk_dynamodb::types::{AttributeDefinition, TableDescription};
 use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+use aws_smithy_types::timeout::TimeoutConfig;
 use log::{debug, error, info};
 use serde_yaml::Error as SerdeYAMLError;
 use std::convert::{TryFrom, TryInto};
@@ -48,6 +49,15 @@ const CONFIG_PATH_ENV_VAR_NAME: &str = "DYNEIN_CONFIG_DIR";
 const CONFIG_FILE_NAME: &str = "config.yml";
 const CACHE_FILE_NAME: &str = "cache.yml";
 const LOCAL_REGION: &str = "local";
+
+/// Upper bound for a single HTTP attempt (one full request/response
+/// exchange). Without it, a connection that goes silent after being
+/// established leaves the request future pending forever, and retry settings
+/// never engage because the attempt never fails. 30s is generous for
+/// DynamoDB: every data-plane response is page-bounded (1 MB), BatchWriteItem
+/// P99 is sub-second, and even a full Scan/Query page completes well within
+/// it, so only a genuinely stuck attempt can hit the timeout.
+const OPERATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum DyneinFileType {
     ConfigFile,
@@ -277,7 +287,15 @@ impl Context {
         let sdk_region = Region::new(region_name.to_owned());
 
         let provider = RegionProviderChain::first_try(sdk_region);
-        let mut config = aws_config::defaults(BehaviorVersion::v2025_08_07()).region(provider);
+        // aws-config merges this with its default timeout information, which
+        // currently sets only a connect timeout (3.1s).
+        let mut config = aws_config::defaults(BehaviorVersion::v2025_08_07())
+            .region(provider)
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_attempt_timeout(OPERATION_ATTEMPT_TIMEOUT)
+                    .build(),
+            );
         if self.is_local().await {
             config = config.endpoint_url(format!("http://localhost:{}", self.effective_port()));
         }
@@ -854,6 +872,38 @@ mod tests {
         assert_eq!(cx5.effective_table_name(), String::from("argtbl"));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sdk_config_sets_operation_attempt_timeout() {
+        let cx = Context {
+            config: None,
+            cache: None,
+            overwritten_region: Some(Region::from_static("us-east-1")),
+            overwritten_table_name: None,
+            overwritten_port: None,
+            output: None,
+            should_strict_for_query: None,
+            retry: None,
+        };
+        let sdk_config = cx.effective_sdk_config().await;
+        let timeout_config = sdk_config
+            .timeout_config()
+            .expect("timeout config should be set");
+        // Bound each HTTP attempt so that a connection that goes silent after
+        // being established cannot hang a request future forever.
+        assert_eq!(
+            timeout_config.operation_attempt_timeout(),
+            Some(Duration::from_secs(30))
+        );
+        // The default connect timeout provided by aws-config must be preserved
+        // by the merge. 3.1s is aws-config's current internal default, so this
+        // assertion is a canary: if it breaks after an aws-config upgrade,
+        // update the expected value here.
+        assert_eq!(
+            timeout_config.connect_timeout(),
+            Some(Duration::from_millis(3100))
+        );
     }
 
     #[test]
