@@ -24,7 +24,7 @@ use tempfile::tempdir;
 async fn test_export_non_existent_table() -> Result<(), Box<dyn std::error::Error>> {
     let tm = util::setup().await?;
     let mut c = tm.command()?;
-    let cmd = c.args(&[
+    let cmd = c.args([
         "--region",
         "local",
         "--table",
@@ -50,7 +50,7 @@ async fn test_export_empty_table() -> Result<(), Box<dyn std::error::Error>> {
     let temp_path = base_dir.path().join(&table_name);
 
     let mut c = tm.command()?;
-    let cmd = c.args(&[
+    let cmd = c.args([
         "--region",
         "local",
         "--table",
@@ -82,7 +82,7 @@ async fn test_export_with_items() -> Result<(), Box<dyn std::error::Error>> {
     let temp_path = base_dir.path().join(&table_name);
 
     let mut c = tm.command()?;
-    let cmd = c.args(&[
+    let cmd = c.args([
         "--region",
         "local",
         "--table",

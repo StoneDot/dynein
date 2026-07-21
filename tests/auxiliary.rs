@@ -44,7 +44,7 @@ async fn test_custom_config_location() -> Result<(), Box<dyn std::error::Error>>
 
     // run any dy command to generate default config
     let mut c = tm.command()?;
-    c.env("DYNEIN_CONFIG_DIR", dummy_dir).assert();
+    let _ = c.env("DYNEIN_CONFIG_DIR", dummy_dir).assert();
 
     // check config folder created at our desired location
     util::check_dynein_files_existence(&config_dir, true);

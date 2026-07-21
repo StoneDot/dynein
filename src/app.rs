@@ -277,7 +277,7 @@ impl Context {
         let sdk_region = Region::new(region_name.to_owned());
 
         let provider = RegionProviderChain::first_try(sdk_region);
-        let mut config = aws_config::defaults(BehaviorVersion::v2025_08_07()).region(provider);
+        let mut config = aws_config::defaults(BehaviorVersion::v2026_01_12()).region(provider);
         if self.is_local().await {
             config = config.endpoint_url(format!("http://localhost:{}", self.effective_port()));
         }
@@ -793,7 +793,7 @@ mod tests {
         };
         assert_eq!(
             &cx1.effective_region().await,
-            aws_config::load_defaults(BehaviorVersion::v2024_03_28())
+            aws_config::load_defaults(BehaviorVersion::v2026_01_12())
                 .await
                 .region()
                 .unwrap_or(&Region::from_static("us-east-1"))
